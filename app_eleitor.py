@@ -48,7 +48,10 @@ from collectors.camara_collector import (
     listar_deputados,
     montar_como_votou,
 )
-from collectors.emendas_collector import buscar_emendas_portal_transparencia
+from collectors.emendas_collector import (
+    _carregar_token_portal,
+    buscar_emendas_portal_transparencia,
+)
 from collectors.senado_collector import (
     buscar_autorias_senador,
     buscar_despesas_ceaps,
@@ -113,7 +116,7 @@ def _detalhes_sen(codigo: int) -> dict:
     return detalhar_senador(codigo)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _ceap_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -126,7 +129,7 @@ def _ceap_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _eventos_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -139,7 +142,7 @@ def _eventos_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _discursos_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -152,7 +155,7 @@ def _discursos_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _proposicoes_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -166,17 +169,19 @@ def _proposicoes_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# Dados históricos (votações, gastos e emendas de anos passados não mudam):
+# cache de 24h, compartilhado entre todos os visitantes do app.
+@st.cache_data(ttl=86400, show_spinner=False)
 def _como_votou_camara(id_camara: int, ano: int) -> pd.DataFrame:
     return montar_como_votou(id_camara, ano, limite=10)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _votacoes_senado_mandato(codigo: int, inicio: int, fim: int) -> pd.DataFrame:
     return buscar_votacoes_senador(codigo, inicio, ano_fim=fim)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _autorias_senado_mandato(codigo: int, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -190,7 +195,7 @@ def _autorias_senado_mandato(codigo: int, inicio: int, fim: int) -> pd.DataFrame
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _ceaps_senado_mandato(nome: str, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -203,7 +208,7 @@ def _ceaps_senado_mandato(nome: str, inicio: int, fim: int) -> pd.DataFrame:
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def _emendas_mandato(nome_parlamentar: str, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -535,6 +540,14 @@ st.markdown(
 )
 
 nome_para_emendas = detalhes.get("nome_parlamentar") or linha_parl[col_nome]
+
+if not _carregar_token_portal():
+    st.warning(
+        "⚠️ A chave da API do Portal da Transparência não está configurada neste "
+        "servidor, então as emendas não podem ser consultadas. No Streamlit Cloud: "
+        "Settings → Secrets → adicionar PORTAL_TRANSPARENCIA_API_KEY."
+    )
+
 with st.spinner(f"Consultando o Portal da Transparência ({periodo_curto})..."):
     df_emendas = _emendas_mandato(nome_para_emendas, ano_ini, ano_fim)
 
