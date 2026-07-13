@@ -1,0 +1,4 @@
+parlamentar_nome;parlamentar_nome_civil;parlamentar_nome_urna;partido;uf;ano;municipio_beneficiado;codigo_ibge;area;orgao;entidade_beneficiada;valor_empenhado;valor_liquidado;valor_pago;fonte;link_fonte
+Zé Pereira;José da Silva Pereira;Zé Pereira;PEX;SP;2019;São Paulo;3550308;Saúde;Ministério da Saúde;UBS Jardim Exemplo;500000;480000;450000;Portal da Transparência;https://exemplo.gov.br
+Zé Pereira;José da Silva Pereira;Zé Pereira;PEX;SP;2020;Guarulhos;3518800;Infraestrutura;Ministério das Cidades;Pavimentação Bairro Exemplo;300000;300000;280000;Portal da Transparência;https://exemplo.gov.br
+Zé Pereira;José da Silva Pereira;Zé Pereira;PEX;SP;2021;Osasco;3534401;Educação;Ministério da Educação;Reforma Escola Municipal Exemplo;200000;200000;200000;Portal da Transparência;https://exemplo.gov.br
