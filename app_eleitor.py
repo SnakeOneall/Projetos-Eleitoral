@@ -59,6 +59,12 @@ from collectors.senado_collector import (
     detalhar_senador,
     listar_senadores,
 )
+from collectors.alesp_collector import (
+    buscar_despesas_gabinete,
+    buscar_presencas_comissoes,
+    detalhar_deputado_alesp,
+    listar_deputados_alesp,
+)
 
 UFS = ["Todos", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA",
        "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO",
@@ -104,6 +110,29 @@ def _todos_deputados() -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _todos_senadores() -> pd.DataFrame:
     return listar_senadores()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _todos_dep_alesp() -> pd.DataFrame:
+    df = listar_deputados_alesp()
+    if df.empty:
+        return df
+    df = df.rename(columns={"NomeParlamentar": "nome", "Partido": "partido"})
+    df["uf"] = "SP"
+    return df
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _despesas_alesp_mandato(matricula: str, inicio: int, fim: int) -> pd.DataFrame:
+    return buscar_despesas_gabinete(matricula, _anos_do_mandato(inicio, fim))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _presencas_alesp_mandato(id_deputado: str, inicio: int, fim: int,
+                             id_spl: str = None, nome: str = None) -> pd.DataFrame:
+    return buscar_presencas_comissoes(
+        id_deputado, inicio, min(fim, ANO_ATUAL), id_spl=id_spl, nome=nome
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -234,7 +263,11 @@ st.markdown(
 
 col_casa, col_busca, col_uf, col_mandato = st.columns([1.2, 2.2, 0.7, 1.6])
 with col_casa:
-    casa = st.radio("Quem você quer conhecer?", ["Deputado(a) federal", "Senador(a)"], horizontal=False)
+    casa = st.radio(
+        "Quem você quer conhecer?",
+        ["Deputado(a) federal", "Senador(a)", "Deputado(a) estadual (SP)"],
+        horizontal=False,
+    )
 with col_busca:
     termo = st.text_input(
         "Digite o nome (ou parte dele)",
@@ -248,7 +281,9 @@ with col_mandato:
 
 ano_ini, ano_fim = MANDATOS[mandato_rotulo]
 periodo_curto = f"{ano_ini}–{ano_fim}"
-eh_camara = casa.startswith("Deputado")
+eh_camara = casa == "Deputado(a) federal"
+eh_senado = casa == "Senador(a)"
+eh_alesp = casa == "Deputado(a) estadual (SP)"
 
 st.caption(
     "ℹ️ A lista abaixo traz quem está **em exercício hoje**. Ao escolher um mandato "
@@ -258,7 +293,12 @@ st.caption(
 )
 
 with st.spinner("Carregando parlamentares em exercício..."):
-    df_parls = _todos_deputados() if eh_camara else _todos_senadores()
+    if eh_camara:
+        df_parls = _todos_deputados()
+    elif eh_senado:
+        df_parls = _todos_senadores()
+    else:
+        df_parls = _todos_dep_alesp()
 
 if df_parls.empty:
     st.error("Não foi possível carregar a lista na API oficial. Tente novamente em instantes.")
@@ -300,10 +340,13 @@ if eh_camara:
     id_parl = int(linha_parl["id"])
     with st.spinner("Buscando dados oficiais..."):
         detalhes = _detalhes_dep(id_parl)
-else:
+elif eh_senado:
     id_parl = int(linha_parl["codigo"])
     with st.spinner("Buscando dados oficiais..."):
         detalhes = _detalhes_sen(id_parl)
+else:
+    detalhes = detalhar_deputado_alesp(linha_parl.to_dict())
+    id_parl = detalhes["id_alesp"]
 
 st.divider()
 col_foto, col_info = st.columns([1, 5])
@@ -317,11 +360,15 @@ with col_info:
         f"**Partido:** {detalhes.get('partido')} • **Estado:** {detalhes.get('uf')} • "
         f"**Situação do mandato:** {situacao}"
     )
-    if eh_camara and str(situacao).lower() != "exercício":
+    if (eh_camara or eh_alesp) and str(situacao).lower() not in ("exercício", "em exercício"):
         st.info(
             f"ℹ️ Situação **{situacao}**: o parlamentar não está atuando normalmente "
             "no momento (pode estar de licença ou ter assumido outro cargo)."
         )
+    if eh_alesp and detalhes.get("base_eleitoral"):
+        st.markdown(f"**Base eleitoral declarada:** {detalhes['base_eleitoral'][:300]}")
+    if eh_alesp and detalhes.get("areas_atuacao"):
+        st.markdown(f"**Áreas de atuação declaradas:** {detalhes['areas_atuacao'][:300]}")
     st.markdown(f"[📄 Página oficial]({detalhes.get('link_fonte')})")
 
 # ----------------------------------------------------------------------
@@ -370,6 +417,43 @@ if eh_camara:
                 "PL = Projeto de Lei • PEC = Proposta de Emenda à Constituição • "
                 "REQ = Requerimento • RIC = Pedido de informação a ministros"
             )
+elif eh_alesp:
+    with st.spinner(f"Consultando os dados abertos da ALESP ({periodo_curto})... a primeira consulta baixa os arquivos oficiais."):
+        df_presencas = _presencas_alesp_mandato(
+            id_parl, ano_ini, ano_fim,
+            id_spl=detalhes.get("id_spl"),
+            nome=detalhes.get("nome_parlamentar"),
+        )
+
+    c1, c2 = st.columns(2)
+    c1.metric("Presenças em reuniões de comissões", len(df_presencas))
+    comissoes_distintas = (
+        df_presencas["SiglaComissao"].nunique()
+        if not df_presencas.empty and "SiglaComissao" in df_presencas.columns else 0
+    )
+    c2.metric("Comissões diferentes em que atuou", comissoes_distintas)
+
+    st.caption(
+        "⚠️ A ALESP publica em dados abertos a presença nas **comissões permanentes** "
+        "(onde os projetos são analisados antes do plenário). A presença nas sessões "
+        "do plenário não está disponível em formato aberto. Projetos de autoria e "
+        "votos em comissões serão adicionados em uma próxima fase."
+    )
+
+    if not df_presencas.empty and "ano" in df_presencas.columns:
+        por_ano = df_presencas.groupby("ano").size().reset_index()
+        por_ano.columns = ["Ano", "Presenças"]
+        fig_pres = px.bar(por_ano, x="Ano", y="Presenças",
+                          title="Presenças em comissões, ano a ano do mandato")
+        fig_pres.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
+        fig_pres.update_xaxes(dtick=1)
+        st.plotly_chart(fig_pres, use_container_width=True)
+
+    if not df_presencas.empty and "SiglaComissao" in df_presencas.columns:
+        por_com = df_presencas["SiglaComissao"].value_counts().reset_index()
+        por_com.columns = ["Comissão", "Presenças"]
+        with st.expander("📚 Ver presenças por comissão"):
+            st.dataframe(por_com, hide_index=True, use_container_width=True)
 else:
     with st.spinner(f"Consultando o Senado ({periodo_curto})..."):
         df_votacoes_sen = _votacoes_senado_mandato(id_parl, ano_ini, ano_fim)
@@ -415,7 +499,14 @@ st.markdown(
     "parlamentar, um a um. É o retrato mais direto das posições de quem te representa."
 )
 
-if eh_camara:
+if eh_alesp:
+    st.info(
+        "🔜 Os votos dos deputados estaduais nas comissões da ALESP estão em um "
+        "arquivo aberto muito grande (60+ MB) e serão adicionados em uma próxima "
+        "fase, com processamento offline. As votações do plenário da ALESP não "
+        "estão disponíveis em dados abertos."
+    )
+elif eh_camara:
     ano_recente = min(ano_fim, ANO_ATUAL)
     with st.spinner("Buscando as votações nominais mais recentes do plenário (pode levar até 1 minuto)..."):
         df_votou = _como_votou_camara(id_parl, ano_recente)
@@ -467,6 +558,10 @@ if eh_camara:
     with st.spinner(f"Consultando gastos oficiais de {periodo_curto}..."):
         df_gastos = _ceap_mandato(id_parl, ano_ini, ano_fim)
     col_valor, col_tipo, col_ano_g = "valorLiquido", "tipoDespesa", "ano"
+elif eh_alesp:
+    with st.spinner(f"Consultando a verba de gabinete na ALESP ({periodo_curto})..."):
+        df_gastos = _despesas_alesp_mandato(detalhes["matricula"], ano_ini, ano_fim)
+    col_valor, col_tipo, col_ano_g = "Valor", "Tipo", "Ano"
 else:
     with st.spinner(f"Consultando gastos oficiais de {periodo_curto} (CSVs oficiais do Senado)..."):
         nome_busca = detalhes.get("nome_parlamentar") or linha_parl[col_nome]
@@ -512,6 +607,13 @@ else:
                 df_notas, hide_index=True, use_container_width=True,
                 column_config={"Nota fiscal": st.column_config.LinkColumn("Nota fiscal", display_text="abrir 📄")},
             )
+        elif eh_alesp:
+            colunas_exibir = {
+                "Ano": "Ano", "Mes": "Mês", "Tipo": "Tipo", "Fornecedor": "Fornecedor",
+                "CNPJ": "CNPJ", "Valor": "Valor (R$)",
+            }
+            df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
+            st.dataframe(df_notas, hide_index=True, use_container_width=True)
         else:
             colunas_exibir = {
                 "ANO": "Ano", "MES": "Mês", "TIPO_DESPESA": "Tipo", "FORNECEDOR": "Fornecedor",
@@ -520,11 +622,12 @@ else:
             df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
             st.dataframe(df_notas, hide_index=True, use_container_width=True)
 
-fonte_gastos = (
-    "[API de Dados Abertos da Câmara dos Deputados](https://dadosabertos.camara.leg.br/)"
-    if eh_camara
-    else "[Transparência do Senado Federal](https://www12.senado.leg.br/transparencia) (CEAPS)"
-)
+if eh_camara:
+    fonte_gastos = "[API de Dados Abertos da Câmara dos Deputados](https://dadosabertos.camara.leg.br/)"
+elif eh_alesp:
+    fonte_gastos = "[Dados Abertos da ALESP](https://www.al.sp.gov.br/dados-abertos/) (verba de gabinete, desde 2002)"
+else:
+    fonte_gastos = "[Transparência do Senado Federal](https://www12.senado.leg.br/transparencia) (CEAPS)"
 st.caption(f"Fonte: {fonte_gastos}.")
 
 # ----------------------------------------------------------------------
@@ -541,17 +644,27 @@ st.markdown(
 
 nome_para_emendas = detalhes.get("nome_parlamentar") or linha_parl[col_nome]
 
-if not _carregar_token_portal():
-    st.warning(
-        "⚠️ A chave da API do Portal da Transparência não está configurada neste "
-        "servidor, então as emendas não podem ser consultadas. No Streamlit Cloud: "
-        "Settings → Secrets → adicionar PORTAL_TRANSPARENCIA_API_KEY."
+if eh_alesp:
+    df_emendas = pd.DataFrame()
+else:
+    if not _carregar_token_portal():
+        st.warning(
+            "⚠️ A chave da API do Portal da Transparência não está configurada neste "
+            "servidor, então as emendas não podem ser consultadas. No Streamlit Cloud: "
+            "Settings → Secrets → adicionar PORTAL_TRANSPARENCIA_API_KEY."
+        )
+    with st.spinner(f"Consultando o Portal da Transparência ({periodo_curto})..."):
+        df_emendas = _emendas_mandato(nome_para_emendas, ano_ini, ano_fim)
+
+if eh_alesp:
+    st.info(
+        "ℹ️ Emendas de deputados **estaduais** vão para o orçamento do Estado de "
+        "São Paulo, não para o orçamento federal — por isso não aparecem no Portal "
+        "da Transparência federal. A ALESP não publica essas emendas em dados "
+        "abertos; a integração com o portal de transparência do Estado (SIGEO-SP) "
+        "está planejada para uma próxima fase."
     )
-
-with st.spinner(f"Consultando o Portal da Transparência ({periodo_curto})..."):
-    df_emendas = _emendas_mandato(nome_para_emendas, ano_ini, ano_fim)
-
-if df_emendas is None or df_emendas.empty:
+elif df_emendas is None or df_emendas.empty:
     st.info(
         f"Nenhuma emenda encontrada no Portal da Transparência para "
         f"**{nome_para_emendas}** no período {periodo_curto}. Isso pode acontecer se o "
@@ -614,10 +727,11 @@ else:
         "a vários municípios (aparece como 'MÚLTIPLO' no Portal da Transparência)."
     )
 
-st.caption(
-    "Fonte: [Portal da Transparência do Governo Federal]"
-    "(https://portaldatransparencia.gov.br/emendas/consulta)."
-)
+if not eh_alesp:
+    st.caption(
+        "Fonte: [Portal da Transparência do Governo Federal]"
+        "(https://portaldatransparencia.gov.br/emendas/consulta)."
+    )
 
 # ----------------------------------------------------------------------
 # Rodapé institucional
@@ -627,7 +741,7 @@ st.divider()
 st.markdown(
     "##### ℹ️ Sobre este painel\n"
     "Os dados são consultados ao vivo em fontes oficiais: Câmara dos Deputados, "
-    "Senado Federal e Portal da Transparência. Este painel **não faz ranking, nota "
+    "Senado Federal, ALESP e Portal da Transparência. Este painel **não faz ranking, nota "
     "ou recomendação de voto** — apresenta fatos públicos para que cada eleitor tire "
     "suas próprias conclusões (em conformidade com a Resolução TSE nº 23.755/2026). "
     "Números de quantidade não medem qualidade: um bom mandato se avalia também "
