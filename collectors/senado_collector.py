@@ -119,8 +119,12 @@ def detalhar_senador(codigo: int) -> dict:
 # Votações nominais (já vêm com o voto do senador)
 # ----------------------------------------------------------------------
 
-def buscar_votacoes_senador(codigo: int, ano: int) -> pd.DataFrame:
-    """Votações nominais do senador no ano, com o voto dele em cada uma."""
+def buscar_votacoes_senador(codigo: int, ano: int, ano_fim: int = None) -> pd.DataFrame:
+    """Votações nominais do senador, com o voto dele em cada uma.
+
+    Se `ano_fim` for informado, retorna o intervalo [ano, ano_fim]
+    (útil para a visão por mandato/legislatura).
+    """
     dados = _get_json(f"/senador/{int(codigo)}/votacoes", {"ano": int(ano)})
     votacoes = _como_lista(
         dados.get("VotacaoParlamentar", {})
@@ -141,9 +145,12 @@ def buscar_votacoes_senador(codigo: int, ano: int) -> pd.DataFrame:
     df = pd.DataFrame(registros)
     if not df.empty:
         # A API nem sempre respeita o parâmetro ?ano= — garante o recorte aqui.
-        df = df[df["data"].astype(str).str.startswith(str(int(ano)))]
+        anos_validos = df["data"].astype(str).str.slice(0, 4)
+        anos_validos = pd.to_numeric(anos_validos, errors="coerce")
+        fim = int(ano_fim) if ano_fim else int(ano)
+        df = df[(anos_validos >= int(ano)) & (anos_validos <= fim)]
         df = df.sort_values("data", ascending=False).reset_index(drop=True)
-    logger.info(f"{len(df)} votação(ões) nominais do senador {codigo} em {ano}.")
+    logger.info(f"{len(df)} votação(ões) nominais do senador {codigo} ({ano}-{ano_fim or ano}).")
     return df
 
 

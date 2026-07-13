@@ -3,8 +3,12 @@ Radar Eleitoral IA - Painel do Eleitor.
 
 Dashboard separado, feito para o cidadão comum: digite o nome de um
 deputado federal ou senador e veja, em linguagem simples, toda a
-atividade parlamentar — presença, votações, gastos do mandato, emendas
-e projetos — sempre com a fonte oficial ao lado de cada número.
+atividade parlamentar dele **por mandato** (legislatura) — presença,
+votações, gastos, emendas e projetos — sempre com a fonte oficial ao
+lado de cada número.
+
+Cobre as 5 últimas legislaturas federais:
+2023-2026, 2019-2022, 2015-2018, 2011-2014 e 2007-2010.
 
 Princípios:
   - Informar, não recomendar: nenhum ranking, nota ou comparação entre
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import os
 import unicodedata
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -42,7 +47,6 @@ from collectors.camara_collector import (
     detalhar_deputado,
     listar_deputados,
     montar_como_votou,
-    resumir_despesas_ceap,
 )
 from collectors.emendas_collector import buscar_emendas_portal_transparencia
 from collectors.senado_collector import (
@@ -52,13 +56,21 @@ from collectors.senado_collector import (
     detalhar_senador,
     listar_senadores,
 )
-from collectors.senado_collector import resumir_despesas_ceaps as resumir_ceaps_senado
 
 UFS = ["Todos", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA",
        "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO",
        "RR", "RS", "SC", "SE", "SP", "TO"]
 
-ANOS_DISPONIVEIS = [2026, 2025, 2024, 2023]
+# 5 últimas legislaturas federais (eleição -> mandato de 4 anos)
+MANDATOS = {
+    "2023–2026 (mandato atual, eleição de 2022)": (2023, 2026),
+    "2019–2022 (eleição de 2018)": (2019, 2022),
+    "2015–2018 (eleição de 2014)": (2015, 2018),
+    "2011–2014 (eleição de 2010)": (2011, 2014),
+    "2007–2010 (eleição de 2006)": (2007, 2010),
+}
+
+ANO_ATUAL = date.today().year
 
 st.set_page_config(page_title="Radar do Eleitor", page_icon="🔎", layout="wide")
 
@@ -72,8 +84,13 @@ def _moeda(valor: float) -> str:
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _anos_do_mandato(inicio: int, fim: int) -> list:
+    """Anos do mandato que já começaram (não consulta anos futuros)."""
+    return [a for a in range(inicio, fim + 1) if a <= ANO_ATUAL]
+
+
 # ----------------------------------------------------------------------
-# Cache das consultas às APIs oficiais
+# Cache das consultas às APIs oficiais (agregação por mandato)
 # ----------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -97,23 +114,56 @@ def _detalhes_sen(codigo: int) -> dict:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _ceap(id_camara: int, ano: int) -> pd.DataFrame:
-    return buscar_despesas_ceap(id_camara, ano)
+def _ceap_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_despesas_ceap(id_camara, ano)
+            if not df.empty:
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _eventos(id_camara: int, ano: int) -> pd.DataFrame:
-    return buscar_eventos_participados(id_camara, f"{ano}-01-01", f"{ano}-12-31")
+def _eventos_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_eventos_participados(id_camara, f"{ano}-01-01", f"{ano}-12-31")
+            if not df.empty:
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _discursos(id_camara: int, ano: int) -> pd.DataFrame:
-    return buscar_discursos(id_camara, f"{ano}-01-01", f"{ano}-12-31")
+def _discursos_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_discursos(id_camara, f"{ano}-01-01", f"{ano}-12-31")
+            if not df.empty:
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _proposicoes(id_camara: int, ano: int) -> pd.DataFrame:
-    return buscar_proposicoes_autoria(id_camara, ano)
+def _proposicoes_mandato(id_camara: int, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_proposicoes_autoria(id_camara, ano)
+            if not df.empty:
+                df["ano_consulta"] = ano
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -122,26 +172,48 @@ def _como_votou_camara(id_camara: int, ano: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _votacoes_senado(codigo: int, ano: int) -> pd.DataFrame:
-    return buscar_votacoes_senador(codigo, ano)
+def _votacoes_senado_mandato(codigo: int, inicio: int, fim: int) -> pd.DataFrame:
+    return buscar_votacoes_senador(codigo, inicio, ano_fim=fim)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _autorias_senado(codigo: int, ano: int) -> pd.DataFrame:
-    return buscar_autorias_senador(codigo, ano)
+def _autorias_senado_mandato(codigo: int, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_autorias_senador(codigo, ano)
+            if not df.empty:
+                df["ano_consulta"] = ano
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _ceaps_senado(nome: str, ano: int) -> pd.DataFrame:
-    return buscar_despesas_ceaps(nome, ano)
+def _ceaps_senado_mandato(nome: str, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_despesas_ceaps(nome, ano)
+            if not df.empty:
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _emendas(nome_parlamentar: str, ano: int) -> pd.DataFrame:
-    try:
-        return buscar_emendas_portal_transparencia(autor=nome_parlamentar.upper(), ano=ano)
-    except Exception:
-        return pd.DataFrame()
+def _emendas_mandato(nome_parlamentar: str, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        try:
+            df = buscar_emendas_portal_transparencia(autor=nome_parlamentar.upper(), ano=ano)
+            if df is not None and not df.empty:
+                partes.append(df)
+        except Exception:
+            continue
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
 # ----------------------------------------------------------------------
@@ -150,12 +222,12 @@ def _emendas(nome_parlamentar: str, ano: int) -> pd.DataFrame:
 
 st.title("🔎 Radar do Eleitor")
 st.markdown(
-    "**Conheça o trabalho de quem você elegeu — ou pretende eleger.** "
+    "**Conheça o trabalho de quem você elegeu — ou pretende eleger, mandato a mandato.** "
     "Todos os dados vêm de fontes oficiais do governo, com link para conferência. "
     "Este painel informa; a escolha é sua."
 )
 
-col_casa, col_busca, col_uf, col_ano = st.columns([1.3, 2.5, 0.8, 0.8])
+col_casa, col_busca, col_uf, col_mandato = st.columns([1.2, 2.2, 0.7, 1.6])
 with col_casa:
     casa = st.radio("Quem você quer conhecer?", ["Deputado(a) federal", "Senador(a)"], horizontal=False)
 with col_busca:
@@ -166,10 +238,19 @@ with col_busca:
     )
 with col_uf:
     uf_filtro = st.selectbox("Estado", UFS)
-with col_ano:
-    ano = st.selectbox("Ano", ANOS_DISPONIVEIS, index=1)
+with col_mandato:
+    mandato_rotulo = st.selectbox("Mandato (legislatura)", list(MANDATOS.keys()))
 
+ano_ini, ano_fim = MANDATOS[mandato_rotulo]
+periodo_curto = f"{ano_ini}–{ano_fim}"
 eh_camara = casa.startswith("Deputado")
+
+st.caption(
+    "ℹ️ A lista abaixo traz quem está **em exercício hoje**. Ao escolher um mandato "
+    "anterior, você vê o que esse mesmo parlamentar fez naquele período (se já era "
+    "parlamentar na época). Senadores têm mandato de 8 anos — o período selecionado "
+    "mostra a metade correspondente."
+)
 
 with st.spinner("Carregando parlamentares em exercício..."):
     df_parls = _todos_deputados() if eh_camara else _todos_senadores()
@@ -239,17 +320,17 @@ with col_info:
     st.markdown(f"[📄 Página oficial]({detalhes.get('link_fonte')})")
 
 # ----------------------------------------------------------------------
-# Trabalho no plenário
+# Trabalho no plenário (mandato)
 # ----------------------------------------------------------------------
 
 st.divider()
-st.header(f"📋 O trabalho no plenário em {ano}")
+st.header(f"📋 O trabalho no plenário no mandato {periodo_curto}")
 
 if eh_camara:
-    with st.spinner("Consultando a Câmara dos Deputados..."):
-        df_eventos = _eventos(id_parl, ano)
-        df_discursos = _discursos(id_parl, ano)
-        df_props = _proposicoes(id_parl, ano)
+    with st.spinner(f"Consultando a Câmara ano a ano ({periodo_curto})... na primeira vez pode demorar."):
+        df_eventos = _eventos_mandato(id_parl, ano_ini, ano_fim)
+        df_discursos = _discursos_mandato(id_parl, ano_ini, ano_fim)
+        df_props = _proposicoes_mandato(id_parl, ano_ini, ano_fim)
 
     sessoes = contar_sessoes_deliberativas(df_eventos)
     c1, c2, c3, c4 = st.columns(4)
@@ -262,8 +343,18 @@ if eh_camara:
         "⚠️ A participação em sessões vem dos registros de eventos da API oficial da Câmara. "
         "O boletim oficial de frequência (com faltas justificadas) é publicado separadamente. "
         "Importante: o recesso parlamentar (períodos sem sessões, previstos na Constituição) "
-        "não é férias individuais do deputado."
+        "não é férias individuais do deputado. Se o parlamentar não era deputado neste "
+        "período, os números aparecem zerados."
     )
+
+    if not df_props.empty and "ano_consulta" in df_props.columns:
+        por_ano = df_props.groupby("ano_consulta").size().reset_index()
+        por_ano.columns = ["Ano", "Projetos apresentados"]
+        fig_props = px.bar(por_ano, x="Ano", y="Projetos apresentados",
+                           title="Projetos e propostas, ano a ano do mandato")
+        fig_props.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
+        fig_props.update_xaxes(dtick=1)
+        st.plotly_chart(fig_props, use_container_width=True)
 
     if not df_props.empty and "siglaTipo" in df_props.columns:
         tipos = df_props["siglaTipo"].value_counts().reset_index()
@@ -275,13 +366,22 @@ if eh_camara:
                 "REQ = Requerimento • RIC = Pedido de informação a ministros"
             )
 else:
-    with st.spinner("Consultando o Senado Federal..."):
-        df_votacoes_sen = _votacoes_senado(id_parl, ano)
-        df_autorias = _autorias_senado(id_parl, ano)
+    with st.spinner(f"Consultando o Senado ({periodo_curto})..."):
+        df_votacoes_sen = _votacoes_senado_mandato(id_parl, ano_ini, ano_fim)
+        df_autorias = _autorias_senado_mandato(id_parl, ano_ini, ano_fim)
 
     c1, c2 = st.columns(2)
     c1.metric("Votações nominais em que votou", len(df_votacoes_sen))
-    c2.metric("Matérias de autoria no ano", len(df_autorias))
+    c2.metric("Matérias de autoria no mandato", len(df_autorias))
+
+    if not df_autorias.empty and "ano_consulta" in df_autorias.columns:
+        por_ano = df_autorias.groupby("ano_consulta").size().reset_index()
+        por_ano.columns = ["Ano", "Matérias"]
+        fig_aut = px.bar(por_ano, x="Ano", y="Matérias",
+                         title="Matérias de autoria, ano a ano do mandato")
+        fig_aut.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
+        fig_aut.update_xaxes(dtick=1)
+        st.plotly_chart(fig_aut, use_container_width=True)
 
     if not df_autorias.empty and "sigla" in df_autorias.columns:
         tipos = df_autorias["sigla"].value_counts().reset_index()
@@ -304,15 +404,18 @@ with st.expander("❓ O que significa cada número?"):
 # ----------------------------------------------------------------------
 
 st.divider()
-st.header(f"🗳️ Como votou em {ano}")
+st.header(f"🗳️ Como votou (mandato {periodo_curto})")
 st.markdown(
     "As **votações nominais** são aquelas em que fica registrado o voto de cada "
     "parlamentar, um a um. É o retrato mais direto das posições de quem te representa."
 )
 
 if eh_camara:
-    with st.spinner("Buscando as últimas votações nominais do plenário (pode levar até 1 minuto)..."):
-        df_votou = _como_votou_camara(id_parl, ano)
+    ano_recente = min(ano_fim, ANO_ATUAL)
+    with st.spinner("Buscando as votações nominais mais recentes do plenário (pode levar até 1 minuto)..."):
+        df_votou = _como_votou_camara(id_parl, ano_recente)
+        if df_votou.empty and ano_recente - 1 >= ano_ini:
+            df_votou = _como_votou_camara(id_parl, ano_recente - 1)
     if df_votou.empty:
         st.info("Nenhuma votação nominal do plenário encontrada no período.")
     else:
@@ -325,9 +428,10 @@ if eh_camara:
             column_config={"Fonte": st.column_config.LinkColumn("Fonte", display_text="conferir 🔗")},
         )
         st.caption(
-            "Mostrando as 10 votações nominais mais recentes do plenário no ano. "
-            "'Não registrado' = o voto do deputado não consta na lista oficial "
-            "(ausência, licença, obstrução da bancada ou não participação)."
+            f"Mostrando as votações nominais mais recentes do plenário ({ano_recente}), "
+            "para não deixar a consulta lenta. 'Não registrado' = o voto do deputado "
+            "não consta na lista oficial (ausência, licença, obstrução da bancada ou "
+            "não participação)."
         )
 else:
     if df_votacoes_sen.empty:
@@ -338,8 +442,8 @@ else:
         })
         st.dataframe(df_exibir, hide_index=True, use_container_width=True)
         st.caption(
-            f"Mostrando as 20 mais recentes de {len(df_votacoes_sen)} votações nominais do ano. "
-            "Fonte: API de Dados Abertos do Senado Federal."
+            f"Mostrando as 20 mais recentes de {len(df_votacoes_sen)} votações nominais "
+            f"do mandato {periodo_curto}. Fonte: API de Dados Abertos do Senado Federal."
         )
 
 # ----------------------------------------------------------------------
@@ -347,7 +451,7 @@ else:
 # ----------------------------------------------------------------------
 
 st.divider()
-st.header(f"💰 Gastos do mandato em {ano}")
+st.header(f"💰 Gastos do mandato {periodo_curto}")
 st.markdown(
     "Todo parlamentar tem direito a uma **cota** (CEAP na Câmara, CEAPS no Senado): "
     "um valor mensal público para custear o trabalho — escritório, divulgação, "
@@ -355,44 +459,47 @@ st.markdown(
 )
 
 if eh_camara:
-    with st.spinner("Consultando gastos oficiais..."):
-        df_gastos = _ceap(id_parl, ano)
-    resumo_gastos = resumir_despesas_ceap(df_gastos)
+    with st.spinner(f"Consultando gastos oficiais de {periodo_curto}..."):
+        df_gastos = _ceap_mandato(id_parl, ano_ini, ano_fim)
+    col_valor, col_tipo, col_ano_g = "valorLiquido", "tipoDespesa", "ano"
 else:
-    with st.spinner("Consultando gastos oficiais (CSV oficial do Senado)..."):
+    with st.spinner(f"Consultando gastos oficiais de {periodo_curto} (CSVs oficiais do Senado)..."):
         nome_busca = detalhes.get("nome_parlamentar") or linha_parl[col_nome]
-        df_gastos = _ceaps_senado(nome_busca, ano)
-    resumo_gastos = resumir_ceaps_senado(df_gastos)
+        df_gastos = _ceaps_senado_mandato(nome_busca, ano_ini, ano_fim)
+    col_valor, col_tipo, col_ano_g = "VALOR_REEMBOLSADO", "TIPO_DESPESA", "ANO"
 
-st.metric("Total gasto da cota no ano", _moeda(resumo_gastos["total_liquido"]))
-
-if resumo_gastos["por_tipo"]:
-    df_tipo = pd.DataFrame(
-        [(t, v) for t, v in resumo_gastos["por_tipo"].items()],
-        columns=["Tipo de gasto", "Valor (R$)"],
+if df_gastos is None or df_gastos.empty:
+    st.metric("Total gasto da cota no mandato", _moeda(0.0))
+    st.info(
+        "Nenhum gasto de cota encontrado neste período — o parlamentar pode não ter "
+        "exercido mandato nessa legislatura, ou os dados do período não estão disponíveis."
     )
-    fig_tipo = px.bar(
-        df_tipo.sort_values("Valor (R$)"),
-        x="Valor (R$)", y="Tipo de gasto", orientation="h",
-        title="Em que o dinheiro foi usado",
-    )
-    fig_tipo.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_tipo, use_container_width=True)
+else:
+    df_gastos[col_valor] = pd.to_numeric(df_gastos[col_valor], errors="coerce").fillna(0.0)
+    st.metric("Total gasto da cota no mandato", _moeda(float(df_gastos[col_valor].sum())))
 
-if resumo_gastos["por_mes"]:
-    df_mes = pd.DataFrame(
-        [(m, v) for m, v in sorted(resumo_gastos["por_mes"].items())],
-        columns=["Mês", "Valor (R$)"],
-    )
-    fig_mes = px.bar(df_mes, x="Mês", y="Valor (R$)", title="Gasto mês a mês")
-    fig_mes.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_mes, use_container_width=True)
+    g1, g2 = st.columns(2)
+    with g1:
+        if col_ano_g in df_gastos.columns:
+            df_ano = df_gastos.groupby(col_ano_g)[col_valor].sum().reset_index()
+            df_ano.columns = ["Ano", "Valor (R$)"]
+            fig_ano = px.bar(df_ano, x="Ano", y="Valor (R$)", title="Gasto ano a ano do mandato")
+            fig_ano.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+            fig_ano.update_xaxes(dtick=1)
+            st.plotly_chart(fig_ano, use_container_width=True)
+    with g2:
+        if col_tipo in df_gastos.columns:
+            df_tipo = df_gastos.groupby(col_tipo)[col_valor].sum().sort_values(ascending=True).reset_index()
+            df_tipo.columns = ["Tipo de gasto", "Valor (R$)"]
+            fig_tipo = px.bar(df_tipo.tail(10), x="Valor (R$)", y="Tipo de gasto", orientation="h",
+                              title="Em que o dinheiro foi usado (total do mandato)")
+            fig_tipo.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig_tipo, use_container_width=True)
 
-if df_gastos is not None and not df_gastos.empty:
     with st.expander("🧾 Ver cada gasto em detalhe"):
         if eh_camara:
             colunas_exibir = {
-                "mes": "Mês", "tipoDespesa": "Tipo", "nomeFornecedor": "Fornecedor",
+                "ano": "Ano", "mes": "Mês", "tipoDespesa": "Tipo", "nomeFornecedor": "Fornecedor",
                 "valorLiquido": "Valor (R$)", "urlDocumento": "Nota fiscal",
             }
             df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
@@ -402,7 +509,7 @@ if df_gastos is not None and not df_gastos.empty:
             )
         else:
             colunas_exibir = {
-                "MES": "Mês", "TIPO_DESPESA": "Tipo", "FORNECEDOR": "Fornecedor",
+                "ANO": "Ano", "MES": "Mês", "TIPO_DESPESA": "Tipo", "FORNECEDOR": "Fornecedor",
                 "DETALHAMENTO": "Detalhe", "VALOR_REEMBOLSADO": "Valor (R$)",
             }
             df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
@@ -416,26 +523,27 @@ fonte_gastos = (
 st.caption(f"Fonte: {fonte_gastos}.")
 
 # ----------------------------------------------------------------------
-# Emendas parlamentares
+# Emendas parlamentares (mandato)
 # ----------------------------------------------------------------------
 
 st.divider()
-st.header(f"🏥 Emendas parlamentares em {ano}")
+st.header(f"🏥 Emendas parlamentares no mandato {periodo_curto}")
 st.markdown(
     "**Emendas** são a forma como o parlamentar direciona parte do orçamento da União "
     "para obras e serviços — um hospital, uma escola, uma estrada. "
-    "Aqui você vê para onde foi o dinheiro."
+    "Aqui você vê para onde foi o dinheiro, ano a ano do mandato."
 )
 
 nome_para_emendas = detalhes.get("nome_parlamentar") or linha_parl[col_nome]
-with st.spinner("Consultando o Portal da Transparência..."):
-    df_emendas = _emendas(nome_para_emendas, ano)
+with st.spinner(f"Consultando o Portal da Transparência ({periodo_curto})..."):
+    df_emendas = _emendas_mandato(nome_para_emendas, ano_ini, ano_fim)
 
 if df_emendas is None or df_emendas.empty:
     st.info(
         f"Nenhuma emenda encontrada no Portal da Transparência para "
-        f"**{nome_para_emendas}** em {ano}. Isso pode acontecer se o nome registrado "
-        "no Portal for diferente do nome parlamentar, ou se não houve emendas no ano."
+        f"**{nome_para_emendas}** no período {periodo_curto}. Isso pode acontecer se o "
+        "nome registrado no Portal for diferente, se não houve emendas, ou se o período "
+        "é anterior à cobertura do Portal (dados de emendas por autor começam em 2014)."
     )
 else:
     for col in ("valor_empenhado", "valor_pago"):
@@ -443,7 +551,7 @@ else:
             df_emendas[col] = pd.to_numeric(df_emendas[col], errors="coerce").fillna(0.0)
 
     e1, e2, e3 = st.columns(3)
-    e1.metric("Emendas encontradas", len(df_emendas))
+    e1.metric("Emendas no mandato", len(df_emendas))
     e2.metric("Valor destinado (empenhado)", _moeda(float(df_emendas["valor_empenhado"].sum())))
     e3.metric("Valor efetivamente pago", _moeda(float(df_emendas["valor_pago"].sum())))
 
@@ -454,17 +562,28 @@ else:
             "É comum haver diferença — obras demoram, e parte fica para os anos seguintes."
         )
 
-    if "area" in df_emendas.columns and df_emendas["area"].astype(str).str.strip().ne("").any():
-        df_area = (
-            df_emendas.groupby("area")["valor_empenhado"].sum().sort_values(ascending=False).reset_index()
-        )
-        df_area.columns = ["Área", "Valor destinado (R$)"]
-        fig_area = px.bar(
-            df_area, x="Valor destinado (R$)", y="Área", orientation="h",
-            title="Áreas beneficiadas",
-        )
-        fig_area.update_layout(height=350, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_area, use_container_width=True)
+    m1, m2 = st.columns(2)
+    with m1:
+        if "ano" in df_emendas.columns:
+            df_ano_e = df_emendas.copy()
+            df_ano_e["ano"] = pd.to_numeric(df_ano_e["ano"], errors="coerce")
+            df_ano_e = df_ano_e.groupby("ano")["valor_empenhado"].sum().reset_index()
+            df_ano_e.columns = ["Ano", "Valor destinado (R$)"]
+            fig_ano_e = px.bar(df_ano_e, x="Ano", y="Valor destinado (R$)",
+                               title="Emendas ano a ano do mandato")
+            fig_ano_e.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+            fig_ano_e.update_xaxes(dtick=1)
+            st.plotly_chart(fig_ano_e, use_container_width=True)
+    with m2:
+        if "area" in df_emendas.columns and df_emendas["area"].astype(str).str.strip().ne("").any():
+            df_area = (
+                df_emendas.groupby("area")["valor_empenhado"].sum().sort_values(ascending=True).reset_index()
+            )
+            df_area.columns = ["Área", "Valor destinado (R$)"]
+            fig_area = px.bar(df_area.tail(10), x="Valor destinado (R$)", y="Área", orientation="h",
+                              title="Áreas beneficiadas (total do mandato)")
+            fig_area.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig_area, use_container_width=True)
 
     with st.expander("📋 Ver todas as emendas com destino e fonte"):
         colunas_emendas = {
