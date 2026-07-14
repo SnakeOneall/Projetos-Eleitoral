@@ -60,7 +60,14 @@ from collectors.senado_collector import (
     detalhar_senador,
     listar_senadores,
 )
-from collectors.sp_transparencia_collector import buscar_emendas_estaduais_por_autor
+from collectors.sp_transparencia_collector import (
+    baixar_emendas_sp_csv,
+    buscar_emendas_estaduais_por_autor,
+)
+from collectors.obras_sp_collector import (
+    buscar_obras_por_municipio,
+    normalizar_nome_municipio,
+)
 from collectors.alesp_collector import (
     buscar_despesas_gabinete,
     buscar_presencas_comissoes,
@@ -358,8 +365,23 @@ def _emendas_mandato(nome_parlamentar: str, inicio: int, fim: int) -> pd.DataFra
     return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _obras_do_municipio(municipio: str) -> pd.DataFrame:
+    return buscar_obras_por_municipio(municipio)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _emendas_sp_do_municipio(municipio: str, ano: int) -> pd.DataFrame:
+    # O filtro do Portal SP exige o nome EXATO em maiúsculas com acento.
+    nome_oficial = normalizar_nome_municipio(municipio)
+    try:
+        return baixar_emendas_sp_csv(localizacao_gasto=nome_oficial, ano_referencia=str(ano))
+    except Exception:
+        return pd.DataFrame()
+
+
 # ----------------------------------------------------------------------
-# Cabeçalho e busca por nome
+# Cabeçalho e seletor de modo
 # ----------------------------------------------------------------------
 
 # Evita que o tradutor automático do navegador reescreva os textos do painel
@@ -368,10 +390,125 @@ st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True
 
 st.title("🔎 Radar do Eleitor")
 st.markdown(
-    "**Conheça o trabalho de quem você elegeu — ou pretende eleger, mandato a mandato.** "
+    "**Conheça o trabalho de quem você elegeu e o que acontece na sua cidade.** "
     "Todos os dados vêm de fontes oficiais do governo, com link para conferência. "
     "Este painel informa; a escolha é sua."
 )
+
+modo = st.radio(
+    "O que você quer ver?",
+    ["👤 O trabalho de um parlamentar", "🏗️ Obras no seu município (SP)"],
+    horizontal=True,
+)
+
+# ======================================================================
+# MODO OBRAS — seção independente de parlamentar (Estado de São Paulo)
+# ======================================================================
+if modo.startswith("🏗️"):
+    st.divider()
+    st.header("🏗️ Obras no seu município")
+    st.markdown(
+        "Veja as obras do Governo do Estado de São Paulo (rodovias, pontes e "
+        "infraestrutura do DER) que passam pela sua cidade, e as emendas "
+        "estaduais destinadas ao mesmo município. **São coisas diferentes:** a "
+        "obra é executada pelo Estado; a emenda é uma verba que um deputado "
+        "direciona. Aqui você vê os dois lado a lado, para tirar suas conclusões."
+    )
+
+    with st.form("form_obras"):
+        col_m, col_a = st.columns([3, 1])
+        with col_m:
+            municipio_obras = st.text_input(
+                "Digite o nome do município",
+                placeholder="Ex.: Marília, Bauru, São José do Rio Preto...",
+            )
+        with col_a:
+            anos_emenda = [a for a in range(ANO_ATUAL, 2021, -1)]
+            ano_obras = st.selectbox("Ano das emendas", anos_emenda)
+        buscar_obras = st.form_submit_button("🔍 Consultar")
+
+    if not buscar_obras or not (municipio_obras and municipio_obras.strip()):
+        st.info("👆 Digite o nome da sua cidade e clique em **Consultar**.")
+        st.stop()
+
+    with st.spinner(f"Buscando obras estaduais em {municipio_obras}..."):
+        df_obras = _obras_do_municipio(municipio_obras)
+
+    st.subheader(f"🚧 Obras do Estado em {municipio_obras.title()}")
+    if df_obras is None or df_obras.empty:
+        st.info(
+            f"Nenhuma obra do DER encontrada com o município **{municipio_obras}**. "
+            "A base atual cobre obras rodoviárias e de infraestrutura do "
+            "Departamento de Estradas de Rodagem (DER/SP)."
+        )
+    else:
+        o1, o2, o3 = st.columns(3)
+        o1.metric("Obras encontradas", len(df_obras))
+        o2.metric("Investimento total", _moeda(float(df_obras.get("valor", pd.Series(dtype=float)).sum())))
+        concluidas = int(df_obras["status"].astype(str).str.contains("conclu|entreg", case=False, na=False).sum()) if "status" in df_obras.columns else 0
+        o3.metric("Já concluídas", concluidas)
+
+        if "categoria" in df_obras.columns and "valor" in df_obras.columns:
+            df_cat = df_obras.groupby("categoria")["valor"].sum().sort_values(ascending=True).reset_index()
+            df_cat.columns = ["Categoria", "Investimento (R$)"]
+            st.plotly_chart(_fig_barras(df_cat.tail(10), "Investimento (R$)", "Categoria",
+                                        "Investimento por tipo de obra", moeda=True, horizontal=True),
+                            use_container_width=True)
+
+        with st.expander("📋 Ver todas as obras (descrição, status e valor)"):
+            cols_obra = {
+                "obra": "Obra", "categoria": "Categoria", "status": "Status",
+                "valor": "Valor (R$)", "regiao": "Região", "data_entrega": "Entrega",
+            }
+            df_ob = df_obras[[c for c in cols_obra if c in df_obras.columns]].rename(columns=cols_obra)
+            df_ob = _formatar_moeda_df(df_ob, ["Valor (R$)"])
+            st.dataframe(df_ob, hide_index=True, use_container_width=True)
+
+    st.caption(
+        "Fonte: [Dados Abertos do Estado de SP — Obras DER/SP]"
+        "(https://dadosabertos.sp.gov.br/dataset/obras-der-sp)."
+    )
+
+    # Emendas estaduais destinadas ao mesmo município (contexto, não vínculo)
+    st.divider()
+    st.subheader(f"💰 Emendas estaduais para {municipio_obras.title()} em {ano_obras}")
+    with st.spinner("Consultando emendas estaduais do município..."):
+        df_em_muni = _emendas_sp_do_municipio(municipio_obras, ano_obras)
+
+    if df_em_muni is None or df_em_muni.empty:
+        st.info(
+            f"Nenhuma emenda estadual encontrada para {municipio_obras} em {ano_obras}."
+        )
+    else:
+        em1, em2 = st.columns(2)
+        em1.metric("Emendas para o município", len(df_em_muni))
+        em2.metric("Valor destinado", _moeda(float(df_em_muni.get("VALOR EMPENHADO", pd.Series(dtype=float)).sum())))
+        with st.expander("📋 Ver as emendas do município (autor, área e beneficiário)"):
+            cols_em = {
+                "AUTORIA": "Autor(a)", "PARTIDO POLITICO": "Partido",
+                "BENEFICIARIO": "Beneficiário", "OBJETO": "Objeto",
+                "VALOR EMPENHADO": "Destinado (R$)", "VALOR PAGO": "Pago (R$)",
+            }
+            df_em_ex = df_em_muni[[c for c in cols_em if c in df_em_muni.columns]].rename(columns=cols_em)
+            df_em_ex = _formatar_moeda_df(df_em_ex, ["Destinado (R$)", "Pago (R$)"])
+            st.dataframe(df_em_ex, hide_index=True, use_container_width=True)
+
+    st.info(
+        "ℹ️ **Como ler isto:** obras e emendas aparecem juntas por serem do mesmo "
+        "município, mas não são necessariamente ligadas — uma emenda pode financiar "
+        "uma obra que não é do DER, e uma obra do DER pode não vir de emenda. "
+        "Este painel mostra o contexto; o vínculo direto exige conferir os documentos "
+        "oficiais de cada uma."
+    )
+    st.caption(
+        "Fonte das emendas: [Portal da Transparência do Estado de SP]"
+        "(https://www.transparencia.sp.gov.br/EmendasParlamentares/Realizadas)."
+    )
+    st.stop()
+
+# ======================================================================
+# MODO PARLAMENTAR (fluxo original)
+# ======================================================================
 
 # A busca fica dentro de um FORMULÁRIO: nada recarrega enquanto a pessoa digita
 # ou troca opções — só ao clicar em Consultar. Isso elimina as execuções
