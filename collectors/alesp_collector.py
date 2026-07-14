@@ -24,6 +24,7 @@ sem ranking, nota ou recomendação de candidatos.
 """
 
 import logging
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -84,6 +85,28 @@ def listar_deputados_alesp() -> pd.DataFrame:
         df = df.sort_values("NomeParlamentar").reset_index(drop=True)
     logger.info(f"{len(df)} deputado(s) estadual(is) na legislatura atual.")
     return df
+
+
+def foto_deputado_alesp(matricula: str) -> str:
+    """URL da foto oficial do deputado (extraída da página de biografia).
+
+    O arquivo tem nome com hash, então não dá para montar a URL direto;
+    buscamos na página https://www.al.sp.gov.br/deputado/?matricula=...
+    """
+    matricula = str(matricula or "").strip()
+    if not matricula:
+        return ""
+    try:
+        r = requests.get(
+            f"https://www.al.sp.gov.br/deputado/?matricula={matricula}",
+            headers={"User-Agent": "Mozilla/5.0 RadarEleitoral/1.0"},
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        m = re.search(r'https://www3\.al\.sp\.gov\.br/legis/biografia/fotos/[^"\'>\s]+', r.text)
+        return m.group(0) if m else ""
+    except Exception:
+        return ""
 
 
 def detalhar_deputado_alesp(linha: dict) -> dict:

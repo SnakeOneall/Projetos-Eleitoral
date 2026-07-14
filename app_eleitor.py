@@ -74,8 +74,21 @@ from collectors.alesp_collector import (
     buscar_votos_comissoes,
     contar_reunioes_comissoes,
     detalhar_deputado_alesp,
+    foto_deputado_alesp,
     listar_deputados_alesp,
     nomes_comissoes,
+)
+from collectors.camara_sp_collector import (
+    buscar_gastos_gabinete as buscar_gastos_vereador,
+    buscar_projetos_vereador,
+    buscar_votacoes_vereador,
+    detalhar_vereador,
+    foto_vereador,
+    listar_vereadores_atuais,
+    mapa_fotos_vereadores,
+    partido_atual_vereador,
+    resumir_gastos_gabinete as resumir_gastos_vereador,
+    resumir_presenca_vereador,
 )
 
 UFS = ["Todos", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA",
@@ -92,6 +105,15 @@ MANDATOS = {
 }
 
 ANO_ATUAL = date.today().year
+
+# Legislaturas MUNICIPAIS (Câmara de vereadores) — ciclo eleitoral próprio,
+# diferente do federal/estadual. Eleições em 2016, 2020, 2024...; posse em
+# janeiro do ano seguinte. A atual é a 19ª legislatura (2025–2028).
+MANDATOS_MUNICIPAIS = {
+    "2025–2028 (mandato atual, eleição de 2024)": (2025, 2028),
+    "2021–2024 (eleição de 2020)": (2021, 2024),
+    "2017–2020 (eleição de 2016)": (2017, 2020),
+}
 
 # O que significa cada sigla de proposição (Câmara e Senado), para o eleitor
 # não precisar decifrar códigos. Fonte: glossários oficiais das casas.
@@ -220,6 +242,79 @@ def _todos_dep_alesp() -> pd.DataFrame:
     df = df.rename(columns={"NomeParlamentar": "nome", "Partido": "partido"})
     df["uf"] = "SP"
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _todos_vereadores_sp() -> pd.DataFrame:
+    df = listar_vereadores_atuais()
+    if df.empty:
+        return df
+    df["uf"] = "SP"
+    df["partido"] = ""
+    return df
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _projetos_vereador(nome: str) -> dict:
+    return buscar_projetos_vereador(nome)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _gastos_vereador_ano(nome: str, ano: int) -> pd.DataFrame:
+    return buscar_gastos_vereador(nome, ano)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _votacoes_vereador_ano(nome: str, ano: int) -> pd.DataFrame:
+    return buscar_votacoes_vereador(nome, ano)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _gastos_vereador_mandato(nome: str, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        df = buscar_gastos_vereador(nome, ano)
+        if not df.empty:
+            df["ANO"] = ano
+            partes.append(df)
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _presenca_vereador_mandato(nome: str, inicio: int, fim: int) -> dict:
+    total, pres = 0, 0
+    for ano in _anos_do_mandato(inicio, fim):
+        r = resumir_presenca_vereador(nome, ano)
+        total += r.get("total_sessoes", 0)
+        pres += r.get("presencas", 0)
+    pct = round(pres / total * 100, 1) if total else None
+    return {"total_sessoes": total, "presencas": pres, "percentual": pct}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _votacoes_vereador_mandato(nome: str, inicio: int, fim: int) -> pd.DataFrame:
+    partes = []
+    for ano in _anos_do_mandato(inicio, fim):
+        df = buscar_votacoes_vereador(nome, ano)
+        if not df.empty:
+            df["ano"] = ano
+            partes.append(df)
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _partido_vereador(nome: str, ano: int) -> str:
+    return partido_atual_vereador(nome, ano)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _foto_alesp(matricula: str) -> str:
+    return foto_deputado_alesp(matricula)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _mapa_fotos_vereadores() -> dict:
+    return mapa_fotos_vereadores()
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -510,27 +605,32 @@ if modo.startswith("🏗️"):
 # MODO PARLAMENTAR (fluxo original)
 # ======================================================================
 
-# A busca fica dentro de um FORMULÁRIO: nada recarrega enquanto a pessoa digita
-# ou troca opções — só ao clicar em Consultar. Isso elimina as execuções
-# interrompidas que misturavam dados de parlamentares diferentes na tela.
+# O rádio de TIPO fica FORA do formulário: ao trocar o tipo, a página recarrega
+# e o seletor de mandato passa a mostrar as legislaturas certas (a Câmara
+# Municipal tem ciclo próprio, diferente do federal/estadual).
+casa = st.radio(
+    "Quem você quer conhecer?",
+    ["Deputado(a) federal", "Senador(a)", "Deputado(a) estadual (SP)",
+     "Vereador(a) — São Paulo"],
+    horizontal=True,
+)
+# Cada tipo tem seu próprio conjunto de legislaturas.
+mandatos_do_tipo = MANDATOS_MUNICIPAIS if casa == "Vereador(a) — São Paulo" else MANDATOS
+
+# O resto da busca fica em FORMULÁRIO: nada recarrega enquanto a pessoa digita
+# ou troca de mandato — só ao clicar em Consultar.
 with st.form("form_busca"):
-    col_casa, col_busca, col_uf, col_mandato = st.columns([1.2, 2.2, 0.7, 1.6])
-    with col_casa:
-        casa = st.radio(
-            "Quem você quer conhecer?",
-            ["Deputado(a) federal", "Senador(a)", "Deputado(a) estadual (SP)"],
-            horizontal=False,
-        )
+    col_busca, col_uf, col_mandato = st.columns([2.2, 0.7, 1.8])
     with col_busca:
         termo = st.text_input(
             "Digite o nome (ou parte dele)",
             placeholder="Ex.: Maria, Tiririca, Silva...",
-            help="Busca sem diferença de acento ou maiúscula, em todos os estados.",
+            help="Busca sem diferença de acento ou maiúscula.",
         )
     with col_uf:
-        uf_filtro = st.selectbox("Estado", UFS)
+        uf_filtro = st.selectbox("Estado", UFS, disabled=(casa == "Vereador(a) — São Paulo"))
     with col_mandato:
-        mandato_rotulo = st.selectbox("Mandato (legislatura)", list(MANDATOS.keys()))
+        mandato_rotulo = st.selectbox("Mandato (legislatura)", list(mandatos_do_tipo.keys()))
     consultar = st.form_submit_button("🔍 Consultar")
 
 if consultar:
@@ -548,17 +648,21 @@ termo = filtros_busca["termo"]
 uf_filtro = filtros_busca["uf"]
 mandato_rotulo = filtros_busca["mandato"]
 
-ano_ini, ano_fim = MANDATOS[mandato_rotulo]
-periodo_curto = f"{ano_ini}–{ano_fim}"
 eh_camara = casa == "Deputado(a) federal"
 eh_senado = casa == "Senador(a)"
 eh_alesp = casa == "Deputado(a) estadual (SP)"
+eh_vereador = casa == "Vereador(a) — São Paulo"
+
+# O mandato pertence ao conjunto do tipo escolhido (municipal para vereador).
+_dict_mandato = MANDATOS_MUNICIPAIS if eh_vereador else MANDATOS
+ano_ini, ano_fim = _dict_mandato.get(mandato_rotulo, next(iter(_dict_mandato.values())))
+periodo_curto = f"{ano_ini}–{ano_fim}"
 
 st.caption(
     "ℹ️ A lista abaixo traz quem está **em exercício hoje**. Ao escolher um mandato "
     "anterior, você vê o que esse mesmo parlamentar fez naquele período (se já era "
-    "parlamentar na época). Senadores têm mandato de 8 anos — o período selecionado "
-    "mostra a metade correspondente."
+    "parlamentar na época). Senadores têm mandato de 8 anos. Para vereadores, os "
+    "dados são da Câmara Municipal de São Paulo."
 )
 
 with st.spinner("Carregando parlamentares em exercício..."):
@@ -566,8 +670,10 @@ with st.spinner("Carregando parlamentares em exercício..."):
         df_parls = _todos_deputados()
     elif eh_senado:
         df_parls = _todos_senadores()
-    else:
+    elif eh_alesp:
         df_parls = _todos_dep_alesp()
+    else:
+        df_parls = _todos_vereadores_sp()
 
 if df_parls.empty:
     st.error("Não foi possível carregar a lista na API oficial. Tente novamente em instantes.")
@@ -601,7 +707,7 @@ rotulos = [
 # Chave estável por casa legislativa + saneamento do estado: sem isso, o
 # Streamlit pode reaproveitar a seleção antiga quando a lista de opções muda
 # (sintoma: dados novos com nome/foto do parlamentar anterior).
-chave_seletor = f"sel_parlamentar_{'camara' if eh_camara else 'senado' if eh_senado else 'alesp'}"
+chave_seletor = f"sel_parlamentar_{'camara' if eh_camara else 'senado' if eh_senado else 'alesp' if eh_alesp else 'vereador'}"
 if st.session_state.get(chave_seletor) not in rotulos:
     st.session_state.pop(chave_seletor, None)
 
@@ -621,15 +727,33 @@ elif eh_senado:
     id_parl = int(linha_parl["codigo"])
     with st.spinner("Buscando dados oficiais..."):
         detalhes = _detalhes_sen(id_parl)
-else:
+elif eh_alesp:
     detalhes = detalhar_deputado_alesp(linha_parl.to_dict())
+    if not detalhes.get("url_foto"):
+        with st.spinner("Carregando a foto..."):
+            detalhes["url_foto"] = _foto_alesp(detalhes.get("matricula"))
     id_parl = detalhes["id_alesp"]
+else:
+    detalhes = detalhar_vereador(linha_parl[col_nome], linha_parl.get("chave"))
+    with st.spinner("Identificando o partido e a foto..."):
+        detalhes["partido"] = _partido_vereador(linha_parl[col_nome], min(ano_fim, ANO_ATUAL)) or "—"
+        detalhes["url_foto"] = foto_vereador(linha_parl[col_nome], _mapa_fotos_vereadores())
+    id_parl = linha_parl.get("chave")
+
+# Avatar neutro (SVG embutido) para quando a fonte não fornece foto,
+# evitando espaço vazio no perfil.
+_AVATAR_NEUTRO = (
+    "data:image/svg+xml;utf8,"
+    "<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'>"
+    "<rect width='120' height='120' rx='8' fill='%23e9edf3'/>"
+    "<circle cx='60' cy='46' r='24' fill='%23b6c2d1'/>"
+    "<path d='M20 108c0-22 18-34 40-34s40 12 40 34z' fill='%23b6c2d1'/></svg>"
+)
 
 st.divider()
 col_foto, col_info = st.columns([1, 5])
 with col_foto:
-    if detalhes.get("url_foto"):
-        st.image(detalhes["url_foto"], width=120)
+    st.image(detalhes.get("url_foto") or _AVATAR_NEUTRO, width=120)
 with col_info:
     st.subheader(detalhes.get("nome_parlamentar") or linha_parl[col_nome])
     situacao = detalhes.get("situacao") or ("Em exercício" if not eh_camara else "—")
@@ -647,6 +771,156 @@ with col_info:
     if eh_alesp and detalhes.get("areas_atuacao"):
         st.markdown(f"**Áreas de atuação declaradas:** {detalhes['areas_atuacao'][:300]}")
     st.markdown(f"[📄 Página oficial]({detalhes.get('link_fonte')})")
+
+# ======================================================================
+# BLOCO VEREADOR (CMSP) — autocontido; encerra antes do fluxo de deputado
+# ======================================================================
+if eh_vereador:
+    nome_ver = linha_parl[col_nome]
+
+    st.divider()
+    st.header("📋 Produção legislativa")
+    with st.spinner("Consultando o processo legislativo da Câmara Municipal..."):
+        proj = _projetos_vereador(nome_ver)
+    df_tram = proj.get("em_tramitacao", pd.DataFrame())
+    df_leis = proj.get("leis_aprovadas", pd.DataFrame())
+
+    v1, v2 = st.columns(2)
+    v1.metric("Projetos e proposituras em tramitação", len(df_tram))
+    v2.metric("Leis já aprovadas (de autoria)", len(df_leis))
+    st.caption(
+        "Em tramitação estão propostas ainda em análise (projetos de lei, "
+        "requerimentos, indicações, moções etc.); leis aprovadas já produziram "
+        "efeito. Quantidade não é qualidade — vale abrir e ler o conteúdo."
+    )
+
+    # Separa a produção por tipo de propositura (PL, requerimento, indicação, moção...)
+    if not df_tram.empty and "tipo" in df_tram.columns:
+        por_tipo = df_tram["tipo"].value_counts().reset_index()
+        por_tipo.columns = ["Sigla", "Quantidade"]
+        por_tipo.insert(1, "O que é", por_tipo["Sigla"].map(_descrever_sigla))
+        with st.expander("📚 Ver a produção por tipo"):
+            st.dataframe(por_tipo[["Sigla", "O que é", "Quantidade"]],
+                         hide_index=True, use_container_width=True)
+
+    if not df_tram.empty:
+        with st.expander("📄 Ver proposituras em tramitação"):
+            cols = {"tipo": "Tipo", "numero": "Número", "ano": "Ano"}
+            st.dataframe(df_tram[[c for c in cols if c in df_tram.columns]].rename(columns=cols),
+                         hide_index=True, use_container_width=True)
+    if not df_leis.empty:
+        with st.expander("✅ Ver leis aprovadas de autoria"):
+            cols = {"numero": "Lei nº", "publicacao": "Publicação", "projeto": "Projeto de origem"}
+            st.dataframe(df_leis[[c for c in cols if c in df_leis.columns]].rename(columns=cols),
+                         hide_index=True, use_container_width=True)
+
+    st.caption(
+        "Fonte: [SPLEGIS — Câmara Municipal de São Paulo]"
+        "(https://www.saopaulo.sp.leg.br/transparencia/dados-abertos/). "
+        "Projetos e leis são o acumulado do mandato."
+    )
+
+    # Presença nas sessões plenárias (item de assiduidade)
+    st.divider()
+    st.header(f"🪑 Presença nas sessões no mandato {periodo_curto}")
+    with st.spinner(f"Consultando a presença nas sessões ({periodo_curto})..."):
+        pres = _presenca_vereador_mandato(nome_ver, ano_ini, ano_fim)
+    if pres.get("total_sessoes"):
+        p1, p2 = st.columns(2)
+        p1.metric(
+            "Sessões que participou",
+            f"{pres['presencas']} de {pres['total_sessoes']}",
+        )
+        p2.metric("Frequência", f"{pres['percentual']}%" if pres["percentual"] is not None else "—")
+        st.caption(
+            "Presença nas sessões plenárias ordinárias e extraordinárias, segundo o "
+            "registro oficial da Câmara Municipal. O recesso parlamentar (períodos "
+            "sem sessões) não conta como falta."
+        )
+    else:
+        st.info("Ainda não há registro de presença para o período selecionado.")
+    st.caption(
+        "Fonte: registro de presença em plenário da Câmara Municipal de São Paulo "
+        "(dados abertos)."
+    )
+
+    # Como votou (votações nominais do plenário, no mandato)
+    st.divider()
+    st.header(f"🗳️ Como votou no mandato {periodo_curto}")
+    st.markdown(
+        "As **votações nominais** são aquelas em que fica registrado o voto de cada "
+        "vereador, um a um. É o retrato mais direto das posições de quem te representa."
+    )
+    with st.spinner(f"Consultando as votações do plenário ({periodo_curto})... na primeira vez pode demorar."):
+        df_vot = _votacoes_vereador_mandato(nome_ver, ano_ini, ano_fim)
+    if df_vot is None or df_vot.empty:
+        st.info(
+            "Nenhuma votação nominal encontrada para este vereador no período. "
+            "Muitas decisões são por votação simbólica, que não registra voto individual."
+        )
+    else:
+        vv1, vv2, vv3 = st.columns(3)
+        vv1.metric("Votações nominais registradas", len(df_vot))
+        vv2.metric("Votou 'Sim'", int((df_vot["voto"].str.strip().str.lower() == "sim").sum()))
+        vv3.metric("Votou 'Não'", int((df_vot["voto"].str.strip().str.lower().isin(["nao", "não"])).sum()))
+        with st.expander("📄 Ver cada votação e o voto"):
+            cols = {"data": "Data", "materia": "O que foi votado",
+                    "voto": "Voto", "resultado": "Resultado"}
+            st.dataframe(df_vot[[c for c in cols if c in df_vot.columns]].rename(columns=cols),
+                         hide_index=True, use_container_width=True)
+        st.caption(
+            "Fonte: sistema de votações da Câmara Municipal de São Paulo (dados abertos)."
+        )
+
+    st.divider()
+    st.header(f"💰 Verba de gabinete no mandato {periodo_curto}")
+    st.markdown(
+        "Todo vereador tem uma verba pública para custear o mandato (o chamado "
+        "'auxílio-encargos gerais de gabinete'). **Não é salário.** Cada despesa "
+        "abaixo tem fornecedor e valor registrados no sistema oficial de custos."
+    )
+    with st.spinner(f"Consultando os gastos de gabinete ({periodo_curto})..."):
+        df_gv = _gastos_vereador_mandato(nome_ver, ano_ini, ano_fim)
+    resumo_gv = resumir_gastos_vereador(df_gv)
+
+    st.metric("Total gasto no mandato", _moeda(resumo_gv["total"]))
+    if df_gv is not None and not df_gv.empty and "ANO" in df_gv.columns:
+        df_ano_v = df_gv.groupby("ANO")["VALOR"].sum().reset_index()
+        df_ano_v.columns = ["Ano", "Valor (R$)"]
+        st.plotly_chart(_fig_barras(df_ano_v, "Ano", "Valor (R$)",
+                                    "Gasto ano a ano do mandato", moeda=True),
+                        use_container_width=True)
+    if resumo_gv["por_tipo"]:
+        df_tp = pd.DataFrame(list(resumo_gv["por_tipo"].items()), columns=["Tipo de gasto", "Valor (R$)"])
+        df_tp = df_tp.sort_values("Valor (R$)")
+        st.plotly_chart(_fig_barras(df_tp.tail(10), "Valor (R$)", "Tipo de gasto",
+                                    "Em que o dinheiro foi usado (total do mandato)",
+                                    moeda=True, horizontal=True),
+                        use_container_width=True)
+    if df_gv is not None and not df_gv.empty:
+        with st.expander("🧾 Ver cada despesa em detalhe"):
+            cols = {"ANO": "Ano", "MES": "Mês", "DESPESA": "Tipo", "FORNECEDOR": "Fornecedor",
+                    "CNPJ": "CNPJ", "VALOR": "Valor (R$)"}
+            df_d = df_gv[[c for c in cols if c in df_gv.columns]].rename(columns=cols)
+            df_d = _formatar_moeda_df(df_d, ["Valor (R$)"])
+            st.dataframe(df_d, hide_index=True, use_container_width=True)
+    st.caption(
+        "Fonte: [SisGV — Sistema de Custos de Mandato da CMSP]"
+        "(https://www.saopaulo.sp.leg.br/transparencia/dados-abertos/)."
+    )
+
+    st.info(
+        "ℹ️ Vereadores **não têm emendas parlamentares** como deputados e senadores — "
+        "eles atuam pelo orçamento municipal por outros instrumentos."
+    )
+    st.divider()
+    st.markdown(
+        "##### ℹ️ Sobre este painel\n"
+        "Dados oficiais da Câmara Municipal de São Paulo (SPLEGIS e SisGV). Este "
+        "painel **não faz ranking, nota ou recomendação de voto** (Resolução TSE "
+        "nº 23.755/2026). Quantidade não mede qualidade."
+    )
+    st.stop()
 
 # ----------------------------------------------------------------------
 # Trabalho no plenário (mandato)
