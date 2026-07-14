@@ -181,6 +181,27 @@ def contar_sessoes_deliberativas(df_eventos: pd.DataFrame) -> int:
     return int((df_eventos["descricaoTipo"].astype(str).str.contains("Deliberativa", case=False)).sum())
 
 
+def contar_sessoes_deliberativas_total(ano_inicio: int, ano_fim: int) -> int:
+    """Total de sessões deliberativas do plenário realizadas no período.
+
+    Serve de denominador para a presença: 'participou de X de Y sessões'.
+    Usa /eventos com codTipoEvento 110 e 204 (ambos 'Sessão Deliberativa').
+    """
+    total = 0
+    for ano in range(int(ano_inicio), int(ano_fim) + 1):
+        for codigo in ("110", "204"):
+            try:
+                dados = _get_paginado(
+                    "/eventos",
+                    {"codTipoEvento": codigo, "dataInicio": f"{ano}-01-01", "dataFim": f"{ano}-12-31"},
+                )
+                total += len(dados)
+            except requests.HTTPError:
+                continue
+    logger.info(f"{total} sessão(ões) deliberativa(s) do plenário em {ano_inicio}-{ano_fim}.")
+    return total
+
+
 def buscar_discursos(id_camara: int, data_inicio: str, data_fim: str) -> pd.DataFrame:
     """Discursos do deputado em plenário no período."""
     dados = _get_paginado(

@@ -8,6 +8,7 @@ reports/output/*.pdf
 data/tse_raw/
 data/raw/
 data/senado_raw/
+data/alesp_raw/
 data/temp_upload.csv
 .streamlit/
 .streamlit_logs/

@@ -44,6 +44,7 @@ from collectors.camara_collector import (
     buscar_eventos_participados,
     buscar_proposicoes_autoria,
     contar_sessoes_deliberativas,
+    contar_sessoes_deliberativas_total,
     detalhar_deputado,
     listar_deputados,
     montar_como_votou,
@@ -59,11 +60,15 @@ from collectors.senado_collector import (
     detalhar_senador,
     listar_senadores,
 )
+from collectors.sp_transparencia_collector import buscar_emendas_estaduais_por_autor
 from collectors.alesp_collector import (
     buscar_despesas_gabinete,
     buscar_presencas_comissoes,
+    buscar_votos_comissoes,
+    contar_reunioes_comissoes,
     detalhar_deputado_alesp,
     listar_deputados_alesp,
+    nomes_comissoes,
 )
 
 UFS = ["Todos", "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA",
@@ -81,6 +86,41 @@ MANDATOS = {
 
 ANO_ATUAL = date.today().year
 
+# O que significa cada sigla de proposição (Câmara e Senado), para o eleitor
+# não precisar decifrar códigos. Fonte: glossários oficiais das casas.
+TIPOS_PROPOSICAO = {
+    "PL": "Projeto de Lei",
+    "PLP": "Projeto de Lei Complementar",
+    "PEC": "Proposta de Emenda à Constituição",
+    "PDL": "Projeto de Decreto Legislativo",
+    "PRC": "Projeto de Resolução",
+    "PRS": "Projeto de Resolução do Senado",
+    "MPV": "Medida Provisória",
+    "REQ": "Requerimento (pedido formal: audiência, urgência, homenagem etc.)",
+    "RIC": "Pedido de informação a ministros e órgãos do governo",
+    "RCP": "Requerimento de criação de CPI",
+    "INC": "Indicação (sugestão de providência a outro Poder)",
+    "EMP": "Emenda de Plenário (mudança em projeto em votação)",
+    "EMC": "Emenda apresentada em Comissão",
+    "EMR": "Emenda de Relator",
+    "ESB": "Emenda ao Substitutivo",
+    "SBT": "Substitutivo (nova versão de um projeto)",
+    "PRL": "Parecer do Relator",
+    "PAR": "Parecer de Comissão",
+    "VTS": "Voto em Separado (posição divergente do relator)",
+    "DTQ": "Destaque (votação separada de um trecho)",
+    "REC": "Recurso contra decisão",
+    "PFC": "Proposta de Fiscalização e Controle",
+    "SIT": "Sugestão de Iniciativa Popular",
+    "TVR": "Ato de concessão de rádio/TV para análise",
+    "MSC": "Mensagem do Poder Executivo",
+    "OF": "Ofício (comunicação formal)",
+}
+
+
+def _descrever_sigla(sigla: str) -> str:
+    return TIPOS_PROPOSICAO.get(str(sigla).strip().upper(), "Outros documentos do processo legislativo")
+
 st.set_page_config(page_title="Radar do Eleitor", page_icon="🔎", layout="wide")
 
 
@@ -91,6 +131,59 @@ def _sem_acento(texto: str) -> str:
 
 def _moeda(valor: float) -> str:
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _inteiro_br(valor) -> str:
+    return f"{int(valor):,}".replace(",", ".")
+
+
+def _formatar_moeda_df(df: pd.DataFrame, colunas: list) -> pd.DataFrame:
+    """Converte colunas numéricas para texto em moeda (R$ 200.000,00)."""
+    df = df.copy()
+    for c in colunas:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).map(_moeda)
+    return df
+
+
+def _fig_barras(df, x, y, titulo, moeda=False, horizontal=False, altura=320):
+    """Gráfico de barras acessível: valor escrito em cada barra (sem depender
+    de passar o cursor) e eixo monetário em R$. Pensado para todos os públicos."""
+    fig = px.bar(df, x=x, y=y, orientation="h" if horizontal else "v", title=titulo)
+    col_valor = x if horizontal else y
+    if moeda:
+        textos = df[col_valor].map(_moeda)
+    else:
+        textos = df[col_valor].map(_inteiro_br)
+    # "auto" = escreve o valor DENTRO da barra quando cabe; se a barra for
+    # pequena demais, escreve logo ao lado/acima — nunca cortado.
+    fig.update_traces(
+        text=textos,
+        textposition="auto",
+        cliponaxis=False,
+        insidetextanchor="middle",
+        textfont=dict(size=13),
+        insidetextfont=dict(color="white", size=13),
+    )
+    fig.update_layout(height=altura, margin=dict(l=10, r=110 if horizontal else 10, t=40, b=10),
+                      separators=",.", uniformtext_minsize=11, uniformtext_mode="show")
+    # Folga no eixo para o rótulo caber ACIMA/AO LADO da barra sem ser cortado
+    col_num = pd.to_numeric(df[col_valor], errors="coerce").fillna(0)
+    maximo = float(col_num.max()) if len(col_num) else 0.0
+    if maximo > 0:
+        folga = maximo * (1.35 if horizontal else 1.22)
+        if horizontal:
+            fig.update_xaxes(range=[0, folga])
+        else:
+            fig.update_yaxes(range=[0, folga])
+    if moeda:
+        if horizontal:
+            fig.update_xaxes(tickprefix="R$ ")
+        else:
+            fig.update_yaxes(tickprefix="R$ ")
+    if not horizontal:
+        fig.update_xaxes(dtick=1)
+    return fig
 
 
 def _anos_do_mandato(inicio: int, fim: int) -> list:
@@ -206,6 +299,16 @@ def _como_votou_camara(id_camara: int, ano: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def _total_sessoes_camara(inicio: int, fim: int) -> int:
+    return contar_sessoes_deliberativas_total(inicio, min(fim, ANO_ATUAL))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _total_reunioes_alesp(siglas: tuple, inicio: int, fim: int) -> int:
+    return contar_reunioes_comissoes(list(siglas), inicio, min(fim, ANO_ATUAL))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def _votacoes_senado_mandato(codigo: int, inicio: int, fim: int) -> pd.DataFrame:
     return buscar_votacoes_senador(codigo, inicio, ano_fim=fim)
 
@@ -238,6 +341,11 @@ def _ceaps_senado_mandato(nome: str, inicio: int, fim: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def _emendas_sp_mandato(nome_autor: str, inicio: int, fim: int) -> pd.DataFrame:
+    return buscar_emendas_estaduais_por_autor(nome_autor, _anos_do_mandato(inicio, fim))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def _emendas_mandato(nome_parlamentar: str, inicio: int, fim: int) -> pd.DataFrame:
     partes = []
     for ano in _anos_do_mandato(inicio, fim):
@@ -254,6 +362,10 @@ def _emendas_mandato(nome_parlamentar: str, inicio: int, fim: int) -> pd.DataFra
 # Cabeçalho e busca por nome
 # ----------------------------------------------------------------------
 
+# Evita que o tradutor automático do navegador reescreva os textos do painel
+# (ele transforma "mandato a mandato" em "manda a manda", "Cargo" em "Carga" etc.)
+st.markdown('<meta name="google" content="notranslate">', unsafe_allow_html=True)
+
 st.title("🔎 Radar do Eleitor")
 st.markdown(
     "**Conheça o trabalho de quem você elegeu — ou pretende eleger, mandato a mandato.** "
@@ -261,23 +373,43 @@ st.markdown(
     "Este painel informa; a escolha é sua."
 )
 
-col_casa, col_busca, col_uf, col_mandato = st.columns([1.2, 2.2, 0.7, 1.6])
-with col_casa:
-    casa = st.radio(
-        "Quem você quer conhecer?",
-        ["Deputado(a) federal", "Senador(a)", "Deputado(a) estadual (SP)"],
-        horizontal=False,
-    )
-with col_busca:
-    termo = st.text_input(
-        "Digite o nome (ou parte dele)",
-        placeholder="Ex.: Maria, Tiririca, Silva...",
-        help="Busca sem diferença de acento ou maiúscula, em todos os estados.",
-    )
-with col_uf:
-    uf_filtro = st.selectbox("Estado", UFS)
-with col_mandato:
-    mandato_rotulo = st.selectbox("Mandato (legislatura)", list(MANDATOS.keys()))
+# A busca fica dentro de um FORMULÁRIO: nada recarrega enquanto a pessoa digita
+# ou troca opções — só ao clicar em Consultar. Isso elimina as execuções
+# interrompidas que misturavam dados de parlamentares diferentes na tela.
+with st.form("form_busca"):
+    col_casa, col_busca, col_uf, col_mandato = st.columns([1.2, 2.2, 0.7, 1.6])
+    with col_casa:
+        casa = st.radio(
+            "Quem você quer conhecer?",
+            ["Deputado(a) federal", "Senador(a)", "Deputado(a) estadual (SP)"],
+            horizontal=False,
+        )
+    with col_busca:
+        termo = st.text_input(
+            "Digite o nome (ou parte dele)",
+            placeholder="Ex.: Maria, Tiririca, Silva...",
+            help="Busca sem diferença de acento ou maiúscula, em todos os estados.",
+        )
+    with col_uf:
+        uf_filtro = st.selectbox("Estado", UFS)
+    with col_mandato:
+        mandato_rotulo = st.selectbox("Mandato (legislatura)", list(MANDATOS.keys()))
+    consultar = st.form_submit_button("🔍 Consultar")
+
+if consultar:
+    st.session_state["filtros_busca"] = {
+        "casa": casa, "termo": termo, "uf": uf_filtro, "mandato": mandato_rotulo,
+    }
+
+filtros_busca = st.session_state.get("filtros_busca")
+if not filtros_busca:
+    st.info("👆 Escolha quem você quer conhecer, digite um nome se quiser, e clique em **Consultar**.")
+    st.stop()
+
+casa = filtros_busca["casa"]
+termo = filtros_busca["termo"]
+uf_filtro = filtros_busca["uf"]
+mandato_rotulo = filtros_busca["mandato"]
 
 ano_ini, ano_fim = MANDATOS[mandato_rotulo]
 periodo_curto = f"{ano_ini}–{ano_fim}"
@@ -329,7 +461,15 @@ rotulos = [
     f"{linha[col_nome]} ({linha.get(partido_col) or '—'}/{linha.get(uf_col) or '—'})"
     for _, linha in df_filtro.iterrows()
 ]
-escolhido = st.selectbox(f"{len(rotulos)} resultado(s) — escolha:", rotulos)
+# Chave estável por casa legislativa + saneamento do estado: sem isso, o
+# Streamlit pode reaproveitar a seleção antiga quando a lista de opções muda
+# (sintoma: dados novos com nome/foto do parlamentar anterior).
+chave_seletor = f"sel_parlamentar_{'camara' if eh_camara else 'senado' if eh_senado else 'alesp'}"
+if st.session_state.get(chave_seletor) not in rotulos:
+    st.session_state.pop(chave_seletor, None)
+
+st.caption(f"{len(rotulos)} resultado(s) em exercício")
+escolhido = st.selectbox("Escolha o(a) parlamentar:", rotulos, key=chave_seletor)
 linha_parl = df_filtro.iloc[rotulos.index(escolhido)]
 
 # ----------------------------------------------------------------------
@@ -385,8 +525,15 @@ if eh_camara:
         df_props = _proposicoes_mandato(id_parl, ano_ini, ano_fim)
 
     sessoes = contar_sessoes_deliberativas(df_eventos)
+    with st.spinner("Contando o total de sessões do plenário no período..."):
+        total_sessoes = _total_sessoes_camara(ano_ini, ano_fim)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sessões de votação que participou", sessoes)
+    c1.metric(
+        "Sessões de votação que participou",
+        f"{sessoes} de {total_sessoes}" if total_sessoes else sessoes,
+        help="Total de sessões deliberativas realizadas pelo plenário no período, "
+             "segundo a API oficial da Câmara.",
+    )
     c2.metric("Eventos e reuniões no total", len(df_eventos))
     c3.metric("Discursos no plenário", len(df_discursos))
     c4.metric("Projetos e propostas apresentados", len(df_props))
@@ -402,21 +549,17 @@ if eh_camara:
     if not df_props.empty and "ano_consulta" in df_props.columns:
         por_ano = df_props.groupby("ano_consulta").size().reset_index()
         por_ano.columns = ["Ano", "Projetos apresentados"]
-        fig_props = px.bar(por_ano, x="Ano", y="Projetos apresentados",
-                           title="Projetos e propostas, ano a ano do mandato")
-        fig_props.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
-        fig_props.update_xaxes(dtick=1)
-        st.plotly_chart(fig_props, use_container_width=True)
+        st.plotly_chart(_fig_barras(por_ano, "Ano", "Projetos apresentados",
+                                    "Projetos e propostas, ano a ano do mandato", altura=280),
+                        use_container_width=True)
 
     if not df_props.empty and "siglaTipo" in df_props.columns:
         tipos = df_props["siglaTipo"].value_counts().reset_index()
-        tipos.columns = ["Tipo", "Quantidade"]
+        tipos.columns = ["Sigla", "Quantidade"]
+        tipos.insert(1, "O que é", tipos["Sigla"].map(_descrever_sigla))
         with st.expander("📚 Ver os projetos apresentados por tipo"):
-            st.dataframe(tipos, hide_index=True, use_container_width=True)
-            st.caption(
-                "PL = Projeto de Lei • PEC = Proposta de Emenda à Constituição • "
-                "REQ = Requerimento • RIC = Pedido de informação a ministros"
-            )
+            st.dataframe(tipos[["Sigla", "O que é", "Quantidade"]],
+                         hide_index=True, use_container_width=True)
 elif eh_alesp:
     with st.spinner(f"Consultando os dados abertos da ALESP ({periodo_curto})... a primeira consulta baixa os arquivos oficiais."):
         df_presencas = _presencas_alesp_mandato(
@@ -425,13 +568,20 @@ elif eh_alesp:
             nome=detalhes.get("nome_parlamentar"),
         )
 
-    c1, c2 = st.columns(2)
-    c1.metric("Presenças em reuniões de comissões", len(df_presencas))
-    comissoes_distintas = (
-        df_presencas["SiglaComissao"].nunique()
-        if not df_presencas.empty and "SiglaComissao" in df_presencas.columns else 0
+    siglas_atuacao = (
+        tuple(sorted(df_presencas["SiglaComissao"].dropna().unique()))
+        if not df_presencas.empty and "SiglaComissao" in df_presencas.columns else tuple()
     )
-    c2.metric("Comissões diferentes em que atuou", comissoes_distintas)
+    total_reunioes = _total_reunioes_alesp(siglas_atuacao, ano_ini, ano_fim) if siglas_atuacao else 0
+
+    c1, c2 = st.columns(2)
+    c1.metric(
+        "Presenças em reuniões de comissões",
+        f"{len(df_presencas)} de {total_reunioes}" if total_reunioes else len(df_presencas),
+        help="O total considera apenas as reuniões encerradas das comissões em que "
+             "o deputado atuou no período — ninguém participa de todas as comissões da casa.",
+    )
+    c2.metric("Comissões diferentes em que atuou", len(siglas_atuacao))
 
     st.caption(
         "⚠️ A ALESP publica em dados abertos a presença nas **comissões permanentes** "
@@ -443,15 +593,17 @@ elif eh_alesp:
     if not df_presencas.empty and "ano" in df_presencas.columns:
         por_ano = df_presencas.groupby("ano").size().reset_index()
         por_ano.columns = ["Ano", "Presenças"]
-        fig_pres = px.bar(por_ano, x="Ano", y="Presenças",
-                          title="Presenças em comissões, ano a ano do mandato")
-        fig_pres.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
-        fig_pres.update_xaxes(dtick=1)
-        st.plotly_chart(fig_pres, use_container_width=True)
+        st.plotly_chart(_fig_barras(por_ano, "Ano", "Presenças",
+                                    "Presenças em comissões, ano a ano do mandato", altura=280),
+                        use_container_width=True)
 
     if not df_presencas.empty and "SiglaComissao" in df_presencas.columns:
+        mapa_nomes = nomes_comissoes()
         por_com = df_presencas["SiglaComissao"].value_counts().reset_index()
-        por_com.columns = ["Comissão", "Presenças"]
+        por_com.columns = ["Sigla", "Presenças"]
+        por_com.insert(1, "Comissão", por_com["Sigla"].map(
+            lambda s: mapa_nomes.get(s, "Comissão não identificada")
+        ))
         with st.expander("📚 Ver presenças por comissão"):
             st.dataframe(por_com, hide_index=True, use_container_width=True)
 else:
@@ -466,17 +618,17 @@ else:
     if not df_autorias.empty and "ano_consulta" in df_autorias.columns:
         por_ano = df_autorias.groupby("ano_consulta").size().reset_index()
         por_ano.columns = ["Ano", "Matérias"]
-        fig_aut = px.bar(por_ano, x="Ano", y="Matérias",
-                         title="Matérias de autoria, ano a ano do mandato")
-        fig_aut.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
-        fig_aut.update_xaxes(dtick=1)
-        st.plotly_chart(fig_aut, use_container_width=True)
+        st.plotly_chart(_fig_barras(por_ano, "Ano", "Matérias",
+                                    "Matérias de autoria, ano a ano do mandato", altura=280),
+                        use_container_width=True)
 
     if not df_autorias.empty and "sigla" in df_autorias.columns:
         tipos = df_autorias["sigla"].value_counts().reset_index()
-        tipos.columns = ["Tipo", "Quantidade"]
+        tipos.columns = ["Sigla", "Quantidade"]
+        tipos.insert(1, "O que é", tipos["Sigla"].map(_descrever_sigla))
         with st.expander("📚 Ver as matérias apresentadas por tipo"):
-            st.dataframe(tipos, hide_index=True, use_container_width=True)
+            st.dataframe(tipos[["Sigla", "O que é", "Quantidade"]],
+                         hide_index=True, use_container_width=True)
 
 with st.expander("❓ O que significa cada número?"):
     st.markdown(
@@ -500,12 +652,47 @@ st.markdown(
 )
 
 if eh_alesp:
-    st.info(
-        "🔜 Os votos dos deputados estaduais nas comissões da ALESP estão em um "
-        "arquivo aberto muito grande (60+ MB) e serão adicionados em uma próxima "
-        "fase, com processamento offline. As votações do plenário da ALESP não "
-        "estão disponíveis em dados abertos."
+    df_votos_alesp = buscar_votos_comissoes(
+        id_parl, ano_ini, ano_fim,
+        id_spl=detalhes.get("id_spl"),
+        nome=detalhes.get("nome_parlamentar"),
     )
+    if df_votos_alesp is None:
+        st.info(
+            "🔜 Os votos nas comissões ainda não foram processados neste servidor. "
+            "Rode `python scripts/etl_alesp_votacoes.py` e publique o arquivo gerado "
+            "em data/processed para habilitar esta seção."
+        )
+    elif df_votos_alesp.empty:
+        st.info("Nenhum voto em comissões encontrado para este deputado no período.")
+    else:
+        st.metric("Votos registrados em comissões no mandato", len(df_votos_alesp))
+        df_exibir = df_votos_alesp.head(20).copy()
+        df_exibir["link"] = df_exibir["id_documento"].map(
+            lambda i: f"https://www.al.sp.gov.br/propositura/?id={i}" if str(i).strip() else ""
+        )
+        # Nome completo da comissão (o eleitor não conhece as siglas)
+        if "comissao" in df_exibir.columns and df_exibir["comissao"].astype(str).str.strip().ne("").any():
+            df_exibir["nome_comissao"] = df_exibir["comissao"]
+        else:
+            mapa_nomes_votos = nomes_comissoes()
+            df_exibir["nome_comissao"] = df_exibir["sigla_comissao"].map(
+                lambda s: mapa_nomes_votos.get(str(s).strip(), str(s))
+            )
+        df_exibir = df_exibir.rename(columns={
+            "data_reuniao": "Data", "nome_comissao": "Comissão",
+            "voto": "Voto", "link": "Matéria (fonte)",
+        })[["Data", "Comissão", "Voto", "Matéria (fonte)"]]
+        st.dataframe(
+            df_exibir, hide_index=True, use_container_width=True,
+            column_config={"Matéria (fonte)": st.column_config.LinkColumn("Matéria (fonte)", display_text="abrir 🔗")},
+        )
+        st.caption(
+            f"Mostrando os 20 mais recentes de {len(df_votos_alesp)} votos em "
+            "comissões permanentes no mandato. São os votos dados na análise das "
+            "matérias ANTES do plenário — as votações do plenário da ALESP não "
+            "estão disponíveis em dados abertos. Fonte: Dados Abertos ALESP."
+        )
 elif eh_camara:
     ano_recente = min(ano_fim, ANO_ATUAL)
     with st.spinner("Buscando as votações nominais mais recentes do plenário (pode levar até 1 minuto)..."):
@@ -583,18 +770,17 @@ else:
         if col_ano_g in df_gastos.columns:
             df_ano = df_gastos.groupby(col_ano_g)[col_valor].sum().reset_index()
             df_ano.columns = ["Ano", "Valor (R$)"]
-            fig_ano = px.bar(df_ano, x="Ano", y="Valor (R$)", title="Gasto ano a ano do mandato")
-            fig_ano.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
-            fig_ano.update_xaxes(dtick=1)
-            st.plotly_chart(fig_ano, use_container_width=True)
+            st.plotly_chart(_fig_barras(df_ano, "Ano", "Valor (R$)",
+                                        "Gasto ano a ano do mandato", moeda=True),
+                            use_container_width=True)
     with g2:
         if col_tipo in df_gastos.columns:
             df_tipo = df_gastos.groupby(col_tipo)[col_valor].sum().sort_values(ascending=True).reset_index()
             df_tipo.columns = ["Tipo de gasto", "Valor (R$)"]
-            fig_tipo = px.bar(df_tipo.tail(10), x="Valor (R$)", y="Tipo de gasto", orientation="h",
-                              title="Em que o dinheiro foi usado (total do mandato)")
-            fig_tipo.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig_tipo, use_container_width=True)
+            st.plotly_chart(_fig_barras(df_tipo.tail(10), "Valor (R$)", "Tipo de gasto",
+                                        "Em que o dinheiro foi usado (total do mandato)",
+                                        moeda=True, horizontal=True),
+                            use_container_width=True)
 
     with st.expander("🧾 Ver cada gasto em detalhe"):
         if eh_camara:
@@ -603,6 +789,7 @@ else:
                 "valorLiquido": "Valor (R$)", "urlDocumento": "Nota fiscal",
             }
             df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
+            df_notas = _formatar_moeda_df(df_notas, ["Valor (R$)"])
             st.dataframe(
                 df_notas, hide_index=True, use_container_width=True,
                 column_config={"Nota fiscal": st.column_config.LinkColumn("Nota fiscal", display_text="abrir 📄")},
@@ -613,6 +800,7 @@ else:
                 "CNPJ": "CNPJ", "Valor": "Valor (R$)",
             }
             df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
+            df_notas = _formatar_moeda_df(df_notas, ["Valor (R$)"])
             st.dataframe(df_notas, hide_index=True, use_container_width=True)
         else:
             colunas_exibir = {
@@ -620,6 +808,7 @@ else:
                 "DETALHAMENTO": "Detalhe", "VALOR_REEMBOLSADO": "Valor (R$)",
             }
             df_notas = df_gastos[[c for c in colunas_exibir if c in df_gastos.columns]].rename(columns=colunas_exibir)
+            df_notas = _formatar_moeda_df(df_notas, ["Valor (R$)"])
             st.dataframe(df_notas, hide_index=True, use_container_width=True)
 
 if eh_camara:
@@ -657,12 +846,54 @@ else:
         df_emendas = _emendas_mandato(nome_para_emendas, ano_ini, ano_fim)
 
 if eh_alesp:
-    st.info(
-        "ℹ️ Emendas de deputados **estaduais** vão para o orçamento do Estado de "
-        "São Paulo, não para o orçamento federal — por isso não aparecem no Portal "
-        "da Transparência federal. A ALESP não publica essas emendas em dados "
-        "abertos; a integração com o portal de transparência do Estado (SIGEO-SP) "
-        "está planejada para uma próxima fase."
+    with st.spinner(f"Consultando emendas estaduais no Portal da Transparência SP ({periodo_curto})..."):
+        df_emendas_sp = _emendas_sp_mandato(nome_para_emendas, ano_ini, ano_fim)
+
+    if df_emendas_sp is None or df_emendas_sp.empty:
+        st.info(
+            f"Nenhuma emenda estadual encontrada para **{nome_para_emendas}** no "
+            f"período {periodo_curto}. O portal estadual cobre anos a partir de "
+            "2022 (anteriores só em PDF) e considera emendas realizadas/executadas."
+        )
+    else:
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Emendas estaduais no mandato", len(df_emendas_sp))
+        e2.metric("Valor destinado (empenhado)", _moeda(float(df_emendas_sp.get("VALOR EMPENHADO", pd.Series(dtype=float)).sum())))
+        e3.metric("Valor efetivamente pago", _moeda(float(df_emendas_sp.get("VALOR PAGO", pd.Series(dtype=float)).sum())))
+
+        m1, m2 = st.columns(2)
+        with m1:
+            if "ANO REFERENCIA" in df_emendas_sp.columns:
+                df_ano_sp = df_emendas_sp.groupby("ANO REFERENCIA")["VALOR EMPENHADO"].sum().reset_index()
+                df_ano_sp.columns = ["Ano", "Valor destinado (R$)"]
+                st.plotly_chart(_fig_barras(df_ano_sp, "Ano", "Valor destinado (R$)",
+                                            "Emendas estaduais ano a ano", moeda=True),
+                                use_container_width=True)
+        with m2:
+            if "LOCALIZACAO DO GASTO" in df_emendas_sp.columns:
+                df_loc = df_emendas_sp.groupby("LOCALIZACAO DO GASTO")["VALOR EMPENHADO"].sum().sort_values(ascending=True).reset_index()
+                df_loc.columns = ["Município", "Valor destinado (R$)"]
+                st.plotly_chart(_fig_barras(df_loc.tail(10), "Valor destinado (R$)", "Município",
+                                            "Municípios que mais receberam",
+                                            moeda=True, horizontal=True),
+                                use_container_width=True)
+
+        with st.expander("📋 Ver todas as emendas estaduais (beneficiário e objeto)"):
+            colunas_sp = {
+                "ANO REFERENCIA": "Ano", "BENEFICIARIO": "Beneficiário",
+                "OBJETO": "Objeto", "LOCALIZACAO DO GASTO": "Município",
+                "TIPO DE EMENDA": "Tipo", "VALOR EMPENHADO": "Destinado (R$)",
+                "VALOR PAGO": "Pago (R$)",
+            }
+            df_exibir_sp = df_emendas_sp[[c for c in colunas_sp if c in df_emendas_sp.columns]].rename(columns=colunas_sp)
+            df_exibir_sp = _formatar_moeda_df(df_exibir_sp, ["Destinado (R$)", "Pago (R$)"])
+            st.dataframe(df_exibir_sp, hide_index=True, use_container_width=True)
+
+    st.caption(
+        "Fonte: [Consulta oficial de Emendas Parlamentares Realizadas — Portal da "
+        "Transparência do Estado de SP]"
+        "(https://www.transparencia.sp.gov.br/EmendasParlamentares/Realizadas). "
+        "Dados estruturados disponíveis a partir de 2022."
     )
 elif df_emendas is None or df_emendas.empty:
     st.info(
@@ -695,21 +926,19 @@ else:
             df_ano_e["ano"] = pd.to_numeric(df_ano_e["ano"], errors="coerce")
             df_ano_e = df_ano_e.groupby("ano")["valor_empenhado"].sum().reset_index()
             df_ano_e.columns = ["Ano", "Valor destinado (R$)"]
-            fig_ano_e = px.bar(df_ano_e, x="Ano", y="Valor destinado (R$)",
-                               title="Emendas ano a ano do mandato")
-            fig_ano_e.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
-            fig_ano_e.update_xaxes(dtick=1)
-            st.plotly_chart(fig_ano_e, use_container_width=True)
+            st.plotly_chart(_fig_barras(df_ano_e, "Ano", "Valor destinado (R$)",
+                                        "Emendas ano a ano do mandato", moeda=True),
+                            use_container_width=True)
     with m2:
         if "area" in df_emendas.columns and df_emendas["area"].astype(str).str.strip().ne("").any():
             df_area = (
                 df_emendas.groupby("area")["valor_empenhado"].sum().sort_values(ascending=True).reset_index()
             )
             df_area.columns = ["Área", "Valor destinado (R$)"]
-            fig_area = px.bar(df_area.tail(10), x="Valor destinado (R$)", y="Área", orientation="h",
-                              title="Áreas beneficiadas (total do mandato)")
-            fig_area.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig_area, use_container_width=True)
+            st.plotly_chart(_fig_barras(df_area.tail(10), "Valor destinado (R$)", "Área",
+                                        "Áreas beneficiadas (total do mandato)",
+                                        moeda=True, horizontal=True),
+                            use_container_width=True)
 
     with st.expander("📋 Ver todas as emendas com destino e fonte"):
         colunas_emendas = {
@@ -718,6 +947,7 @@ else:
             "valor_pago": "Pago (R$)", "link_fonte": "Fonte oficial",
         }
         df_exibir = df_emendas[[c for c in colunas_emendas if c in df_emendas.columns]].rename(columns=colunas_emendas)
+        df_exibir = _formatar_moeda_df(df_exibir, ["Destinado (R$)", "Pago (R$)"])
         st.dataframe(
             df_exibir, hide_index=True, use_container_width=True,
             column_config={"Fonte oficial": st.column_config.LinkColumn("Fonte oficial", display_text="conferir 🔗")},

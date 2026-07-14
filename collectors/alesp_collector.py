@@ -218,6 +218,97 @@ def buscar_presencas_comissoes(
     return df
 
 
+def nomes_comissoes() -> dict:
+    """Mapa sigla -> nome completo das comissões (ex.: CDH -> Comissão de
+    Direitos Humanos), para a interface não exibir apenas siglas."""
+    raiz = _baixar_xml(f"{BASE_PROCESSO}/comissoes.xml", "comissoes.xml")
+    mapa = {}
+    for c in raiz:
+        dados = _elemento_para_dict(c)
+        sigla = (dados.get("SiglaComissao") or "").strip()
+        nome = (dados.get("NomeComissao") or "").strip()
+        if sigla and nome:
+            mapa[sigla] = nome
+    return mapa
+
+
+# As reuniões concluídas aparecem como "REALIZADA" (registros recentes) ou
+# "ENCERRADA" (legislaturas antigas) no arquivo oficial.
+_SITUACOES_REUNIAO_CONCLUIDA = {"REALIZADA", "ENCERRADA"}
+
+
+def contar_reunioes_comissoes(siglas: list, ano_inicio: int, ano_fim: int) -> int:
+    """Total de reuniões realizadas das comissões informadas no período.
+
+    Denominador justo para a presença: considera apenas as comissões em que
+    o deputado atuou (ninguém participa de todas as comissões da casa).
+    """
+    if not siglas:
+        return 0
+    raiz_com = _baixar_xml(f"{BASE_PROCESSO}/comissoes.xml", "comissoes.xml")
+    sigla_por_id = {}
+    for c in raiz_com:
+        dados = _elemento_para_dict(c)
+        sigla_por_id[dados.get("IdComissao", "")] = dados.get("SiglaComissao", "")
+
+    raiz_reu = _baixar_xml(
+        f"{BASE_PROCESSO}/comissoes_permanentes_reunioes.xml",
+        "comissoes_permanentes_reunioes.xml",
+    )
+    alvo = {str(s).strip().upper() for s in siglas}
+    total = 0
+    for r in raiz_reu:
+        dados = _elemento_para_dict(r)
+        if (dados.get("Situacao") or "").upper() not in _SITUACOES_REUNIAO_CONCLUIDA:
+            continue
+        ano = str(dados.get("Data") or "")[:4]
+        if not (ano.isdigit() and int(ano_inicio) <= int(ano) <= int(ano_fim)):
+            continue
+        sigla = (sigla_por_id.get(dados.get("IdComissao", "")) or "").strip().upper()
+        if sigla in alvo:
+            total += 1
+    logger.info(f"{total} reunião(ões) encerradas das comissões {sorted(alvo)} em {ano_inicio}-{ano_fim}.")
+    return total
+
+
+# ----------------------------------------------------------------------
+# Votos nas comissões (lê o compacto gerado pelo ETL offline)
+# ----------------------------------------------------------------------
+
+PROCESSED_VOTACOES = Path(__file__).resolve().parent.parent / "data" / "processed" / "alesp_votacoes_comissoes.csv.gz"
+
+
+def buscar_votos_comissoes(
+    id_deputado: str,
+    ano_inicio: int,
+    ano_fim: int,
+    id_spl: str = None,
+    nome: str = None,
+):
+    """Votos do deputado nas comissões, a partir do compacto do ETL.
+
+    Retorna None se o ETL ainda não foi executado (arquivo ausente).
+    Gerar/atualizar com: python scripts/etl_alesp_votacoes.py
+    """
+    if not PROCESSED_VOTACOES.exists():
+        return None
+    df = pd.read_csv(PROCESSED_VOTACOES, dtype={"id_deputado": str, "id_documento": str})
+
+    ids_validos = {str(id_deputado).strip()}
+    if id_spl:
+        ids_validos.add(str(id_spl).strip())
+    mask = df["id_deputado"].astype(str).str.strip().isin(ids_validos)
+    if nome and "deputado" in df.columns:
+        alvo = str(nome).strip().casefold()
+        mask = mask | (df["deputado"].astype(str).str.strip().str.casefold() == alvo)
+    df = df[mask]
+
+    df = df[(df["ano"] >= int(ano_inicio)) & (df["ano"] <= int(ano_fim))]
+    df = df.sort_values("data_reuniao", ascending=False).reset_index(drop=True)
+    logger.info(f"{len(df)} voto(s) em comissões do deputado {id_deputado} ({ano_inicio}-{ano_fim}).")
+    return df
+
+
 if __name__ == "__main__":
     # Teste manual rápido
     deputados = listar_deputados_alesp()
