@@ -1,0 +1,28 @@
+# Configuração de deploy no Render (https://render.com)
+# Web Service que roda o Painel do Eleitor (Streamlit).
+#
+# Passos no painel do Render:
+#   1. New + → Web Service → conecte o repositório do GitHub.
+#   2. O Render lê este render.yaml automaticamente (Blueprint).
+#   3. Em "Environment", adicione a variável secreta:
+#        PORTAL_TRANSPARENCIA_API_KEY = a36d908f650c6e0e3085694feb158c86
+#   4. Deploy.
+#
+# Importante: no plano gratuito o serviço "hiberna" após inatividade e faz
+# cold start (~30-60s) no primeiro acesso, e tem pouca RAM — o que ainda pode
+# travar nas consultas pesadas. Para uso público estável, o plano "Starter"
+# (pago) mantém o serviço quente e com mais memória.
+
+services:
+  - type: web
+    name: radar-do-eleitor
+    runtime: python
+    plan: free            # troque para "starter" para não hibernar e ter mais RAM
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app_eleitor.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false"
+    envVars:
+      - key: PORTAL_TRANSPARENCIA_API_KEY
+        sync: false        # valor definido manualmente no painel (secreto)
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+    autoDeploy: true       # redeploy automático a cada push no GitHub

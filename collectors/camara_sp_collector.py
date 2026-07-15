@@ -185,30 +185,49 @@ def _debito_mes(ano: int, mes: int) -> pd.DataFrame:
     return pd.DataFrame(dados if isinstance(dados, list) else [dados])
 
 
-def buscar_gastos_gabinete(nome: str, ano: int) -> pd.DataFrame:
-    """Despesas do mandato do vereador no ano (verba de gabinete, SisGV).
+def baixar_gastos_ano(ano: int) -> pd.DataFrame:
+    """TODAS as despesas de gabinete do ano (todos os vereadores), voto a voto.
 
-    O SisGV entrega por mês (todos os vereadores); filtramos pelo nome.
+    Faz 12 requisições ao SisGV (uma por mês). Usado pelo ETL offline.
     """
-    alvo = _sem_acento(nome)
     partes = []
     for mes in range(1, 13):
         try:
             df_mes = _debito_mes(ano, mes)
         except Exception:
             continue
-        if df_mes.empty or "VEREADOR" not in df_mes.columns:
-            continue
-        recorte = df_mes[df_mes["VEREADOR"].map(_sem_acento) == alvo]
-        if not recorte.empty:
-            partes.append(recorte)
+        if not df_mes.empty:
+            partes.append(df_mes)
     if not partes:
         return pd.DataFrame()
     df = pd.concat(partes, ignore_index=True)
     if "VALOR" in df.columns:
         df["VALOR"] = pd.to_numeric(df["VALOR"], errors="coerce").fillna(0.0)
-    logger.info(f"{nome}: {len(df)} despesa(s) de gabinete em {ano}.")
     return df
+
+
+def buscar_gastos_gabinete(nome: str, ano: int) -> pd.DataFrame:
+    """Despesas do vereador no ano (verba de gabinete, SisGV).
+
+    Usa o compacto do ETL (cmsp_gastos.csv.gz) quando existir; caso contrário,
+    consulta o SisGV ao vivo (12 requisições por ano).
+    """
+    alvo = _sem_acento(nome)
+    if CMSP_GASTOS_CACHE.exists():
+        df = pd.read_csv(CMSP_GASTOS_CACHE)
+        df = df[pd.to_numeric(df["ANO"], errors="coerce") == int(ano)]
+        recorte = df[df["VEREADOR"].map(_sem_acento) == alvo].copy()
+        if "VALOR" in recorte.columns:
+            recorte["VALOR"] = pd.to_numeric(recorte["VALOR"], errors="coerce").fillna(0.0)
+        return recorte.reset_index(drop=True)
+
+    # Fallback ao vivo
+    df = baixar_gastos_ano(ano)
+    if df.empty or "VEREADOR" not in df.columns:
+        return pd.DataFrame()
+    recorte = df[df["VEREADOR"].map(_sem_acento) == alvo].reset_index(drop=True)
+    logger.info(f"{nome}: {len(recorte)} despesa(s) de gabinete em {ano}.")
+    return recorte
 
 
 def resumir_gastos_gabinete(df: pd.DataFrame) -> dict:
@@ -304,8 +323,51 @@ def buscar_presencas_ano(ano: int) -> pd.DataFrame:
     return df
 
 
+# ----------------------------------------------------------------------
+# Cache pré-processado (ETL offline) — evita baixar centenas de XMLs ao vivo
+# ----------------------------------------------------------------------
+
+PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
+CMSP_VOTACOES_CACHE = PROCESSED_DIR / "cmsp_votacoes.csv.gz"
+CMSP_PRESENCAS_CACHE = PROCESSED_DIR / "cmsp_presencas.csv.gz"
+CMSP_GASTOS_CACHE = PROCESSED_DIR / "cmsp_gastos.csv.gz"
+
+
+def _ler_cache_votacoes(ano: int) -> pd.DataFrame | None:
+    """Lê as votações do ano do compacto gerado pelo ETL (ou None se ausente)."""
+    if not CMSP_VOTACOES_CACHE.exists():
+        return None
+    df = pd.read_csv(CMSP_VOTACOES_CACHE, dtype=str)
+    df = df[pd.to_numeric(df["ano"], errors="coerce") == int(ano)]
+    return df
+
+
+def votacoes_ano(ano: int) -> pd.DataFrame:
+    """Votações do ano: usa o compacto do ETL; se não houver, baixa ao vivo."""
+    cache = _ler_cache_votacoes(ano)
+    if cache is not None:
+        return cache.reset_index(drop=True)
+    return baixar_votacoes_ano(ano)
+
+
 def resumir_presenca_vereador(nome: str, ano: int) -> dict:
-    """'Participou de X de Y sessões (Z%)' para o vereador no ano."""
+    """'Participou de X de Y sessões (Z%)' para o vereador no ano.
+
+    Usa o compacto pré-agregado do ETL (cmsp_presencas.csv.gz) quando existir;
+    caso contrário, calcula ao vivo.
+    """
+    if CMSP_PRESENCAS_CACHE.exists():
+        df = pd.read_csv(CMSP_PRESENCAS_CACHE)
+        df = df[pd.to_numeric(df["ano"], errors="coerce") == int(ano)]
+        if not df.empty:
+            alvo = _sem_acento(nome)
+            total_sessoes = int(df["total_sessoes"].iloc[0])
+            dele = df[df["vereador"].map(_sem_acento) == alvo]
+            presencas = int(dele["presencas"].iloc[0]) if not dele.empty else 0
+            pct = round(presencas / total_sessoes * 100, 1) if total_sessoes else None
+            return {"total_sessoes": total_sessoes, "presencas": presencas, "percentual": pct}
+
+    # Fallback ao vivo (mais lento)
     df = buscar_presencas_ano(ano)
     if df.empty:
         return {"total_sessoes": 0, "presencas": 0, "percentual": None}
@@ -319,7 +381,7 @@ def resumir_presenca_vereador(nome: str, ano: int) -> dict:
 
 def buscar_votacoes_vereador(nome: str, ano: int) -> pd.DataFrame:
     """Como o vereador votou nas votações nominais do ano."""
-    df = baixar_votacoes_ano(ano)
+    df = votacoes_ano(ano)
     if df.empty:
         return df
     alvo = _sem_acento(nome)
@@ -335,8 +397,8 @@ def partido_atual_vereador(nome: str, ano: int = None) -> str:
     from datetime import date
     ano = ano or date.today().year
     for tentativa in (ano, ano - 1):
-        df = baixar_votacoes_ano(tentativa)
-        if df.empty:
+        df = votacoes_ano(tentativa)
+        if df is None or df.empty:
             continue
         alvo = _sem_acento(nome)
         recorte = df[df["vereador"].map(_sem_acento) == alvo]
