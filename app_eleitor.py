@@ -71,8 +71,11 @@ from collectors.obras_sp_collector import (
 from collectors.prefeitura_sp_collector import (
     anos_disponiveis_execucao,
     execucao_emendas,
+    execucao_funcao_gestao,
     execucao_por_funcao,
     execucao_por_orgao,
+    gestoes_disponiveis,
+    totais_por_ano_gestao,
 )
 from collectors.alesp_collector import (
     buscar_despesas_gabinete,
@@ -498,6 +501,21 @@ def _execucao_emendas(ano: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def _gestoes_disponiveis() -> list:
+    return gestoes_disponiveis()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _execucao_funcao_gestao(nome: str) -> pd.DataFrame:
+    return execucao_funcao_gestao(nome)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _totais_ano_gestao(nome: str) -> pd.DataFrame:
+    return totais_por_ano_gestao(nome)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def _emendas_sp_do_municipio(municipio: str, ano: int) -> pd.DataFrame:
     # O filtro do Portal SP exige o nome EXATO em maiúsculas com acento.
     nome_oficial = normalizar_nome_municipio(municipio)
@@ -551,7 +569,66 @@ if modo.startswith("🏛️"):
         )
         st.stop()
 
-    ano_exec = st.selectbox("Ano", anos_exec)
+    col_vis, col_sel = st.columns([1, 2])
+    with col_vis:
+        visao = st.radio("Ver por", ["Ano", "Gestão (prefeito)"], horizontal=False)
+
+    # ---- Visão por GESTÃO (compara mandatos de prefeito) -------------------
+    if visao.startswith("Gestão"):
+        gestoes = _gestoes_disponiveis()
+        with col_sel:
+            gestao = st.selectbox("Gestão", gestoes)
+        st.caption(
+            "ℹ️ A execução é somada em todos os anos do mandato. Dados abertos com "
+            "esquema comparável começam em 2020 — gestões anteriores serão somadas "
+            "quando o histórico antigo (formato diferente) for processado."
+        )
+        with st.spinner("Carregando a execução da gestão..."):
+            df_func = _execucao_funcao_gestao(gestao)
+            df_anos = _totais_ano_gestao(gestao)
+
+        if df_func.empty:
+            st.info("Sem dados processados para esta gestão.")
+            st.stop()
+
+        tot_orc = float(df_func["orcado_atualizado"].sum())
+        tot_pago = float(df_func["pago"].sum())
+        pct = round(tot_pago / tot_orc * 100, 1) if tot_orc else 0
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Orçado no mandato", _moeda(tot_orc))
+        m2.metric("Pago no mandato", _moeda(tot_pago))
+        m3.metric("% executado", f"{pct}%")
+
+        if not df_anos.empty:
+            da = df_anos.rename(columns={"ano": "Ano", "pago": "Pago (R$)"})
+            st.plotly_chart(_fig_barras(da, "Ano", "Pago (R$)", "Pago ano a ano da gestão", moeda=True),
+                            use_container_width=True)
+
+        st.subheader("Para onde foi o dinheiro na gestão (por área)")
+        df_area_g = df_func.rename(columns={"Ds_Funcao": "Área"}).sort_values("pago", ascending=True)
+        st.plotly_chart(
+            _fig_barras(df_area_g.tail(12), "pago", "Área", "Total pago por área no mandato",
+                        moeda=True, horizontal=True, altura=460),
+            use_container_width=True,
+        )
+        with st.expander("📊 Ver a execução de cada área no mandato"):
+            tg = df_func.rename(columns={
+                "Ds_Funcao": "Área", "orcado_atualizado": "Orçado (R$)",
+                "pago": "Pago (R$)", "pct_executado": "% executado",
+            })
+            tg = _formatar_moeda_df(tg[["Área", "Orçado (R$)", "Pago (R$)", "% executado"]],
+                                    ["Orçado (R$)", "Pago (R$)"])
+            st.dataframe(tg, hide_index=True, use_container_width=True)
+        st.caption(
+            "Fonte: [Execução Orçamentária — Secretaria da Fazenda de SP]"
+            "(https://dados.prefeitura.sp.gov.br/dataset/base-dados-execucao). "
+            "Fatos oficiais; a análise é do cidadão."
+        )
+        st.stop()
+
+    # ---- Visão por ANO (padrão) -------------------------------------------
+    with col_sel:
+        ano_exec = st.selectbox("Ano", anos_exec)
 
     with st.spinner("Carregando a execução orçamentária..."):
         df_func = _execucao_funcao(ano_exec)

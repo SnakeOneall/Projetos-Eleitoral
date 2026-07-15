@@ -36,7 +36,9 @@ SAIDA_FUNCAO = OUT_DIR / "pmsp_execucao_funcao.csv.gz"
 SAIDA_ORGAO = OUT_DIR / "pmsp_execucao_orgao.csv.gz"
 SAIDA_EMENDAS = OUT_DIR / "pmsp_execucao_emendas.csv.gz"
 
-ANOS_PADRAO = list(range(2023, date.today().year + 1))
+# Esquema moderno (função/órgão/valores) existe a partir de 2020 (XLSX/CSV).
+# Anos anteriores usam layout antigo (mensal) e são ignorados pelo coletor.
+ANOS_PADRAO = list(range(2020, date.today().year + 1))
 
 
 def executar(anos: list) -> None:

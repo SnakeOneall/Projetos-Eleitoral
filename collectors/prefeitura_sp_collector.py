@@ -63,43 +63,79 @@ def _criar_logger() -> logging.Logger:
 logger = _criar_logger()
 
 
-def _url_csv_execucao(ano: int) -> str | None:
-    """URL de download do CSV da execução orçamentária do ano (via CKAN)."""
+def _url_execucao(ano: int) -> tuple:
+    """(url, formato) da execução do ano. Prefere CSV; cai para XLSX.
+
+    Só CSV e XLSX têm o esquema MODERNO (2020+). Anos anteriores (XLS/ZIP)
+    usam outro layout (colunas mensais) e não são lidos por este coletor.
+    """
     r = requests.get(f"{CKAN}/package_show", params={"id": DATASET_EXECUCAO},
                      headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     recursos = r.json().get("result", {}).get("resources", [])
+    alvo = str(ano)
+    csv_url = xlsx_url = None
     for rec in recursos:
-        if str(rec.get("format", "")).upper() == "CSV" and str(ano) in str(rec.get("name", "")):
-            return rec.get("url")
-    return None
+        nome_url = f"{rec.get('name','')} {rec.get('url','')}"
+        if alvo not in nome_url:
+            continue
+        fmt = str(rec.get("format", "")).upper()
+        if fmt == "CSV":
+            csv_url = rec.get("url")
+        elif fmt == "XLSX":
+            xlsx_url = rec.get("url")
+    if csv_url:
+        return csv_url, "CSV"
+    if xlsx_url:
+        return xlsx_url, "XLSX"
+    return None, None
+
+
+def _normalizar_valores(df: pd.DataFrame, brasileiro: bool) -> pd.DataFrame:
+    """Renomeia/normaliza as colunas de valor. Se o esquema moderno não estiver
+    presente (ano antigo, layout diferente), devolve DataFrame vazio.
+
+    `brasileiro=True` (CSV): valores vêm como "1.234.567,89" — remove o ponto
+    de milhar e troca a vírgula decimal por ponto.
+    `brasileiro=False` (XLSX): valores já usam ponto decimal — converte direto
+    (tratar como brasileiro aqui inflaria os números em 100×).
+    """
+    if "Ds_Funcao" not in df.columns or "Vl_Pago" not in df.columns:
+        return pd.DataFrame()  # esquema antigo/incompatível
+    for bruto, limpo in COLS_VALOR.items():
+        if bruto in df.columns:
+            serie = df[bruto].astype(str).str.strip()
+            if brasileiro:
+                serie = serie.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+            else:
+                # XLSX: só remove eventual separador de milhar com vírgula
+                serie = serie.str.replace(",", "", regex=False)
+            df[limpo] = pd.to_numeric(serie, errors="coerce").fillna(0.0)
+    return df
 
 
 def baixar_execucao(ano: int) -> pd.DataFrame:
-    """Baixa e normaliza a base de execução orçamentária do ano.
-
-    Retorna DataFrame com as colunas descritivas + valores numéricos
-    normalizados (colunas renomeadas para orcado, empenhado, liquidado, pago...).
-    """
-    url = _url_csv_execucao(ano)
+    """Baixa e normaliza a base de execução orçamentária do ano (CSV ou XLSX)."""
+    url, fmt = _url_execucao(ano)
     if not url:
-        logger.info(f"CSV de execução {ano} não encontrado no CKAN.")
+        logger.info(f"Execução {ano} sem CSV/XLSX no CKAN (formato antigo?).")
         return pd.DataFrame()
 
-    logger.info(f"Baixando execução orçamentária {ano}...")
+    logger.info(f"Baixando execução orçamentária {ano} ({fmt})...")
     resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
     resp.raise_for_status()
-    texto = resp.content.decode("latin-1", errors="replace")
 
-    df = pd.read_csv(StringIO(texto), sep=";", dtype=str, low_memory=False)
-    for bruto, limpo in COLS_VALOR.items():
-        if bruto in df.columns:
-            df[limpo] = (
-                df[bruto].astype(str)
-                .str.replace(".", "", regex=False)
-                .str.replace(",", ".", regex=False)
-            )
-            df[limpo] = pd.to_numeric(df[limpo], errors="coerce").fillna(0.0)
+    if fmt == "CSV":
+        texto = resp.content.decode("latin-1", errors="replace")
+        df = pd.read_csv(StringIO(texto), sep=";", dtype=str, low_memory=False)
+        df = _normalizar_valores(df, brasileiro=True)
+    else:  # XLSX
+        from io import BytesIO
+        df = pd.read_excel(BytesIO(resp.content), dtype=str)
+        df = _normalizar_valores(df, brasileiro=False)
+    if df.empty:
+        logger.info(f"Execução {ano}: esquema incompatível (ano antigo). Ignorado.")
+        return df
     df["ano"] = int(ano)
     logger.info(f"{len(df)} dotações carregadas ({ano}).")
     return df
@@ -156,6 +192,36 @@ def dotacoes_por_emenda(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------
+# Gestões municipais (mandatos do prefeito) — para comparar administrações
+# ----------------------------------------------------------------------
+
+# Cada gestão é um mandato de 4 anos. Dados abertos com esquema moderno
+# começam em 2020; os anos disponíveis definem quais gestões aparecem.
+GESTOES = [
+    ("2025–2028 · Ricardo Nunes", 2025, 2028),
+    ("2021–2024 · Bruno Covas / Ricardo Nunes", 2021, 2024),
+    ("2017–2020 · João Doria / Bruno Covas", 2017, 2020),
+    ("2013–2016 · Fernando Haddad", 2013, 2016),
+    ("2009–2012 · Gilberto Kassab", 2009, 2012),
+    ("2005–2008 · José Serra / Gilberto Kassab", 2005, 2008),
+]
+
+
+def gestao_do_ano(ano: int) -> str:
+    for nome, ini, fim in GESTOES:
+        if ini <= int(ano) <= fim:
+            return nome
+    return f"Gestão {ano}"
+
+
+def anos_da_gestao(nome_gestao: str) -> list:
+    for nome, ini, fim in GESTOES:
+        if nome == nome_gestao:
+            return list(range(ini, fim + 1))
+    return []
+
+
+# ----------------------------------------------------------------------
 # Leitura dos compactos gerados pelo ETL (scripts/etl_prefeitura.py)
 # ----------------------------------------------------------------------
 
@@ -202,6 +268,49 @@ def execucao_emendas(ano: int) -> pd.DataFrame:
     if not cache.empty:
         return cache
     return dotacoes_por_emenda(baixar_execucao(ano))
+
+
+def gestoes_disponiveis() -> list:
+    """Gestões que têm pelo menos um ano com dados processados."""
+    anos = set(anos_disponiveis_execucao())
+    return [nome for nome, ini, fim in GESTOES if anos & set(range(ini, fim + 1))]
+
+
+def _ler_compacto_gestao(caminho: Path, nome_gestao: str) -> pd.DataFrame:
+    """Lê o compacto e recorta pelos anos da gestão (sem agregar entre anos)."""
+    if not caminho.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(caminho)
+    anos = anos_da_gestao(nome_gestao)
+    if "ano" in df.columns and anos:
+        df = df[pd.to_numeric(df["ano"], errors="coerce").isin(anos)]
+    return df.reset_index(drop=True)
+
+
+def execucao_funcao_gestao(nome_gestao: str) -> pd.DataFrame:
+    """Execução por função somada em toda a gestão (todos os anos do mandato)."""
+    df = _ler_compacto_gestao(CACHE_FUNCAO, nome_gestao)
+    if df.empty or "Ds_Funcao" not in df.columns:
+        return df
+    g = df.groupby("Ds_Funcao").agg(
+        orcado_atualizado=("orcado_atualizado", "sum"),
+        empenhado=("empenhado", "sum"),
+        pago=("pago", "sum"),
+    ).reset_index()
+    denom = g["orcado_atualizado"].where(g["orcado_atualizado"] != 0)
+    g["pct_executado"] = (g["pago"] / denom * 100).round(1)
+    return g.sort_values("pago", ascending=False).reset_index(drop=True)
+
+
+def totais_por_ano_gestao(nome_gestao: str) -> pd.DataFrame:
+    """Totais (orçado, pago) por ano dentro da gestão — para o gráfico anual."""
+    df = _ler_compacto_gestao(CACHE_FUNCAO, nome_gestao)
+    if df.empty:
+        return df
+    return df.groupby("ano").agg(
+        orcado_atualizado=("orcado_atualizado", "sum"),
+        pago=("pago", "sum"),
+    ).reset_index()
 
 
 if __name__ == "__main__":
