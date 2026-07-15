@@ -348,6 +348,75 @@ def partido_atual_vereador(nome: str, ano: int = None) -> str:
     return ""
 
 
+# ----------------------------------------------------------------------
+# Pessoal do gabinete e subsídio (salário do cargo)
+# ----------------------------------------------------------------------
+
+# Subsídio mensal do vereador de SP, vigente desde fev/2025 (reajuste de 37%
+# aprovado em nov/2024; antes era R$ 18.991,68). É o salário DO CARGO —
+# igual para os 55 vereadores, não individual.
+SUBSIDIO_VEREADOR_SP = 26080.98
+
+# Estrutura legal do gabinete: até 18 cargos de livre indicação do parlamentar.
+CARGOS_LIVRES_POR_GABINETE = 18
+
+FUNCIONARIOS_XML = (
+    "https://www.saopaulo.sp.leg.br/static/transparencia/funcionarios/"
+    "CMSP-XML-Funcionarios.xml"
+)
+
+
+def _numero_gabinete_por_vereador() -> dict:
+    """nome normalizado -> número do gabinete que o vereador ocupa hoje."""
+    from datetime import date
+    hoje = date.today().isoformat()
+    mapa = {}
+    for o in _get_splegis("OcupacaoGabineteJSON"):
+        fim = str(o.get("fim") or "9999")[:10]
+        if fim >= hoje and o.get("vereador"):
+            mapa[_sem_acento(o.get("vereador"))] = o.get("gabinete")
+    return mapa
+
+
+def contar_funcionarios_por_gabinete() -> dict:
+    """número do gabinete -> quantidade de assessores lotados.
+
+    Fonte: relação de funcionários em formato aberto (XML). O campo
+    Centro_de_Custos traz 'NNº GABINETE DE VEREADOR'.
+    """
+    from collections import Counter
+    try:
+        r = requests.get(FUNCIONARIOS_XML, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        raiz = ET.fromstring(r.content)
+    except Exception:
+        return {}
+    contagem = Counter()
+    for f in raiz.iter("Funcionario"):
+        cc = (f.findtext("Centro_de_Custos") or "").strip()
+        m = re.match(r"0*(\d+)\s*º?\s*GABINETE DE VEREADOR", cc, re.IGNORECASE)
+        if m:
+            contagem[int(m.group(1))] += 1
+    return dict(contagem)
+
+
+def pessoal_gabinete_vereador(nome: str) -> dict:
+    """Estrutura de pessoal e salário do cargo para um vereador.
+
+    Observação: o número exato de assessores por gabinete NÃO é exposto de
+    forma confiável nos dados abertos (o campo Centro_de_Custos do arquivo de
+    funcionários rotula apenas parte dos assessores como 'GABINETE DE VEREADOR').
+    Por isso retornamos a estrutura legal (até 18 cargos livres) e o subsídio,
+    sem uma contagem que induziria o eleitor ao erro. As funções
+    _numero_gabinete_por_vereador e contar_funcionarios_por_gabinete ficam
+    disponíveis para quando a Câmara publicar a lotação completa.
+    """
+    return {
+        "cargos_livres_max": CARGOS_LIVRES_POR_GABINETE,
+        "subsidio_mensal": SUBSIDIO_VEREADOR_SP,
+    }
+
+
 def mapa_fotos_vereadores() -> dict:
     """nome normalizado -> URL da foto, extraído da página de membros da CMSP.
 

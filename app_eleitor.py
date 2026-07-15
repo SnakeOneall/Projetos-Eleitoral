@@ -87,6 +87,7 @@ from collectors.camara_sp_collector import (
     listar_vereadores_atuais,
     mapa_fotos_vereadores,
     partido_atual_vereador,
+    pessoal_gabinete_vereador,
     resumir_gastos_gabinete as resumir_gastos_vereador,
     resumir_presenca_vereador,
 )
@@ -315,6 +316,11 @@ def _foto_alesp(matricula: str) -> str:
 @st.cache_data(ttl=86400, show_spinner=False)
 def _mapa_fotos_vereadores() -> dict:
     return mapa_fotos_vereadores()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _pessoal_vereador(nome: str) -> dict:
+    return pessoal_gabinete_vereador(nome)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -907,6 +913,34 @@ if eh_vereador:
     st.caption(
         "Fonte: [SisGV — Sistema de Custos de Mandato da CMSP]"
         "(https://www.saopaulo.sp.leg.br/transparencia/dados-abertos/)."
+    )
+
+    # Estrutura e custo do mandato (salário do cargo + estrutura de pessoal)
+    st.divider()
+    st.header("👥 Estrutura e custo do mandato")
+    with st.spinner("Consultando a estrutura de pessoal do gabinete..."):
+        pessoal = _pessoal_vereador(nome_ver)
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Salário do cargo (subsídio)", f"{_moeda(pessoal['subsidio_mensal'])}/mês")
+    cc2.metric("Custo do subsídio ao ano", _moeda(pessoal["subsidio_mensal"] * 13 + pessoal["subsidio_mensal"] / 3),
+               help="12 meses + 13º salário + 1/3 de férias.")
+    cc3.metric("Cargos de assessor por gabinete", f"até {pessoal['cargos_livres_max']}")
+    st.markdown(
+        "O **subsídio** é o salário do cargo de vereador — **igual para todos os 55** "
+        "(não é individual), reajustado em 37% em 2025. Cada gabinete pode ter até "
+        f"**{pessoal['cargos_livres_max']} cargos de livre indicação** do parlamentar "
+        "(assessores comissionados), além dos servidores efetivos de concurso."
+    )
+    st.caption(
+        "ℹ️ A CMSP tem cerca de 2.200 funcionários no total (455 efetivos, ~1.200 "
+        "comissionados de gabinete). O **número exato de assessores e o valor da folha "
+        "de cada gabinete** dependem do portal de Salários Abertos, cujo acesso "
+        "individualizado exige identificação por CPF — por isso não é consolidado "
+        "automaticamente aqui. "
+        "Fontes: [subsídio e custos de mandato]"
+        "(https://www.saopaulo.sp.leg.br/transparencia/custos-de-mandato/) • "
+        "[quadro de funcionários (dados abertos)]"
+        "(https://www.saopaulo.sp.leg.br/institucional/recursos-humanos/funcionarios/)."
     )
 
     st.info(
