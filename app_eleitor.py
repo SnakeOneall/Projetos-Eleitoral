@@ -68,6 +68,12 @@ from collectors.obras_sp_collector import (
     buscar_obras_por_municipio,
     normalizar_nome_municipio,
 )
+from collectors.prefeitura_sp_collector import (
+    anos_disponiveis_execucao,
+    execucao_emendas,
+    execucao_por_funcao,
+    execucao_por_orgao,
+)
 from collectors.alesp_collector import (
     buscar_despesas_gabinete,
     buscar_presencas_comissoes,
@@ -472,6 +478,26 @@ def _obras_do_municipio(municipio: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def _anos_execucao() -> list:
+    return anos_disponiveis_execucao()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _execucao_funcao(ano: int) -> pd.DataFrame:
+    return execucao_por_funcao(ano)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _execucao_orgao(ano: int) -> pd.DataFrame:
+    return execucao_por_orgao(ano)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _execucao_emendas(ano: int) -> pd.DataFrame:
+    return execucao_emendas(ano)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def _emendas_sp_do_municipio(municipio: str, ano: int) -> pd.DataFrame:
     # O filtro do Portal SP exige o nome EXATO em maiúsculas com acento.
     nome_oficial = normalizar_nome_municipio(municipio)
@@ -498,9 +524,123 @@ st.markdown(
 
 modo = st.radio(
     "O que você quer ver?",
-    ["👤 O trabalho de um parlamentar", "🏗️ Obras no seu município (SP)"],
+    ["👤 O trabalho de um parlamentar", "🏗️ Obras no seu município (SP)",
+     "🏛️ Gestão da cidade de SP"],
     horizontal=True,
 )
+
+# ======================================================================
+# MODO GESTÃO DA CIDADE — execução orçamentária da Prefeitura de SP
+# ======================================================================
+if modo.startswith("🏛️"):
+    st.divider()
+    st.header("🏛️ Gestão da cidade de São Paulo")
+    st.markdown(
+        "Como a Prefeitura de São Paulo usa o dinheiro público: quanto foi "
+        "**orçado** para cada área e quanto de fato foi **pago**. Dados oficiais "
+        "da Secretaria da Fazenda. Este painel mostra **fatos e a fonte** — a "
+        "leitura e a conclusão são suas."
+    )
+
+    anos_exec = _anos_execucao()
+    if not anos_exec:
+        st.warning(
+            "Os dados de execução orçamentária ainda não foram processados neste "
+            "servidor. Rode `python scripts/etl_prefeitura.py` e publique os arquivos "
+            "gerados em data/processed."
+        )
+        st.stop()
+
+    ano_exec = st.selectbox("Ano", anos_exec)
+
+    with st.spinner("Carregando a execução orçamentária..."):
+        df_func = _execucao_funcao(ano_exec)
+        df_org = _execucao_orgao(ano_exec)
+        df_em = _execucao_emendas(ano_exec)
+
+    if df_func.empty:
+        st.info("Sem dados de execução para o ano selecionado.")
+        st.stop()
+
+    total_orcado = float(df_func["orcado_atualizado"].sum())
+    total_pago = float(df_func["pago"].sum())
+    pct_geral = round(total_pago / total_orcado * 100, 1) if total_orcado else 0
+
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Orçamento atualizado", _moeda(total_orcado))
+    g2.metric("Efetivamente pago", _moeda(total_pago))
+    g3.metric("% executado (pago/orçado)", f"{pct_geral}%")
+    st.caption(
+        "**Orçado atualizado**: o quanto a cidade reservou para gastar (já com "
+        "ajustes do ano). **Pago**: o quanto de fato saiu do caixa. A diferença "
+        "mostra o que foi planejado mas não realizado."
+    )
+
+    # Gasto por área (função)
+    st.subheader("Para onde vai o dinheiro (por área)")
+    df_area = df_func.rename(columns={"Ds_Funcao": "Área"}).sort_values("pago", ascending=True)
+    st.plotly_chart(
+        _fig_barras(df_area.tail(12), "pago", "Área", "Valor pago por área", moeda=True, horizontal=True, altura=460),
+        use_container_width=True,
+    )
+    with st.expander("📊 Ver a execução de cada área (orçado, pago e % executado)"):
+        tab = df_func.rename(columns={
+            "Ds_Funcao": "Área", "orcado_atualizado": "Orçado (R$)",
+            "empenhado": "Empenhado (R$)", "liquidado": "Liquidado (R$)",
+            "pago": "Pago (R$)", "pct_executado": "% executado",
+        })
+        cols = [c for c in ["Área", "Orçado (R$)", "Empenhado (R$)", "Pago (R$)", "% executado"] if c in tab.columns]
+        tab = _formatar_moeda_df(tab[cols], ["Orçado (R$)", "Empenhado (R$)", "Pago (R$)"])
+        st.dataframe(tab, hide_index=True, use_container_width=True)
+        st.caption(
+            "Uma % executada muito baixa em uma área pode indicar recurso "
+            "planejado que não chegou a ser gasto — vale investigar o porquê na fonte."
+        )
+
+    # Por órgão / secretaria
+    if not df_org.empty:
+        st.subheader("Por secretaria / órgão")
+        with st.expander("🏢 Ver a execução por órgão"):
+            tabo = df_org.rename(columns={
+                "Sigla_Orgao": "Sigla", "Ds_Orgao": "Órgão",
+                "orcado_atualizado": "Orçado (R$)", "empenhado": "Empenhado (R$)",
+                "pago": "Pago (R$)", "pct_executado": "% executado",
+            })
+            colso = [c for c in ["Sigla", "Órgão", "Orçado (R$)", "Pago (R$)", "% executado"] if c in tabo.columns]
+            tabo = _formatar_moeda_df(tabo[colso], ["Orçado (R$)", "Pago (R$)"])
+            st.dataframe(tabo, hide_index=True, use_container_width=True)
+
+    # Dotações vinculadas a emendas parlamentares (cruzamento)
+    st.subheader("💰 Dinheiro de emendas parlamentares")
+    if df_em.empty:
+        st.info("Nenhuma dotação vinculada a emenda encontrada para o ano.")
+    else:
+        e1, e2 = st.columns(2)
+        e1.metric("Dotações com emenda", len(df_em))
+        e2.metric("Valor pago via emendas", _moeda(float(df_em["pago"].sum())))
+        with st.expander("📋 Ver as dotações de emendas (órgão, área e valores)"):
+            tabe = df_em.rename(columns={
+                "Cd_Nro_Emenda_Dotacao": "Nº emenda", "Ds_Orgao": "Órgão",
+                "Ds_Funcao": "Área", "orcado_atualizado": "Orçado (R$)",
+                "empenhado": "Empenhado (R$)", "pago": "Pago (R$)",
+            })
+            colse = [c for c in ["Nº emenda", "Órgão", "Área", "Orçado (R$)", "Pago (R$)"] if c in tabe.columns]
+            tabe = _formatar_moeda_df(tabe[colse], ["Orçado (R$)", "Pago (R$)"])
+            st.dataframe(tabe, hide_index=True, use_container_width=True)
+        st.caption(
+            "Cada dotação traz o número da emenda que a originou. O vínculo com o "
+            "vereador autor será somado numa próxima fase, ligando esta execução às "
+            "emendas da Câmara Municipal."
+        )
+
+    st.divider()
+    st.caption(
+        "Fonte: [Execução Orçamentária — Secretaria da Fazenda de SP]"
+        "(https://dados.prefeitura.sp.gov.br/dataset/base-dados-execucao) "
+        "(dados abertos). Este painel apresenta os números oficiais de forma "
+        "factual; não afirma irregularidade — a análise é do cidadão."
+    )
+    st.stop()
 
 # ======================================================================
 # MODO OBRAS — seção independente de parlamentar (Estado de São Paulo)
